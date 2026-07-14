@@ -16,7 +16,7 @@ import triton.language as tl
 
 from fla.ops.cp.comm import all_gather_into_tensor
 from fla.ops.utils.op import exp2
-from fla.utils import autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_NPU, autotune_cache_kwargs, check_shared_mem
 
 if TYPE_CHECKING:
     from fla.ops.cp.context import FLACPContext
@@ -747,6 +747,22 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
     if context is None or context.group is None:
         return initial_state
     assert initial_state is None, "When enable CP, the provided initial_state must be None."
+    if IS_NPU and g is not None and gk is None and bg is None:
+        from fla.ops.cp.backends.triton_ascend import chunk_gated_delta_rule_fwd_h_pre_process_npu
+        return chunk_gated_delta_rule_fwd_h_pre_process_npu(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            gk=gk,
+            bg=bg,
+            v=v,
+            chunk_size=chunk_size,
+            state_v_first=state_v_first,
+            cu_seqlens=cu_seqlens,
+            initial_state=initial_state,
+            context=context,
+        )
     rank = dist.get_rank(group=context.group)
 
     B, T, H, K, V, HV = *k.shape, u.shape[-1], u.shape[2]
@@ -834,6 +850,25 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
     if context is None or context.group is None:
         return dht, initial_state
     assert dht is None, "When enable CP, the provided dht must be None."
+    if IS_NPU and g is not None and gk is None and bg is None:
+        from fla.ops.cp.backends.triton_ascend import chunk_gated_delta_rule_bwd_dhu_pre_process_npu
+        return chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
+            q=q,
+            k=k,
+            w=w,
+            do=do,
+            dv=dv,
+            g=g,
+            gk=gk,
+            bg=bg,
+            scale=scale,
+            state_v_first=state_v_first,
+            cu_seqlens=cu_seqlens,
+            dht=dht,
+            initial_state=initial_state,
+            context=context,
+            chunk_size=chunk_size,
+        )
     rank = dist.get_rank(context.group)
 
     B, T, H, K, V, HV = *q.shape, do.shape[-1], do.shape[2]
