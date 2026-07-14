@@ -1197,11 +1197,18 @@ def chunk_gated_delta_rule_fwd_h_pre_process_npu(
     del B
     assert K <= 256, 'current kernel does not support head dimension larger than 256.'
     N = 1 if cu_seqlens is None else len(cu_seqlens) - 1
-    hm = k.new_zeros(HV, K, V + K, dtype=torch.float32)
-    if state_v_first:
-        output = k.new_zeros(N, HV, V, K, dtype=torch.float32)
+    if context.is_last_rank:
+        hm = k.new_zeros(HV, K, V + K, dtype=torch.float32)
     else:
-        output = k.new_zeros(N, HV, K, V, dtype=torch.float32)
+        hm = k.new_empty(HV, K, V + K, dtype=torch.float32)
+    if state_v_first:
+        output_shape = (N, HV, V, K)
+    else:
+        output_shape = (N, HV, K, V)
+    if context.is_first_rank or N != 1:
+        output = k.new_zeros(output_shape, dtype=torch.float32)
+    else:
+        output = k.new_empty(output_shape, dtype=torch.float32)
 
     if not context.is_last_rank:
         bos, eos = _segment_bounds(cu_seqlens, context, forward=True, fallback_t=T)
@@ -1335,11 +1342,18 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
     del B
     assert K <= 256, 'current kernel does not support head dimension being larger than 256.'
     N = 1 if cu_seqlens is None else len(cu_seqlens) - 1
-    dhm = q.new_zeros(HV, K, V + K, dtype=torch.float32)
-    if state_v_first:
-        output = q.new_zeros(N, HV, V, K, dtype=torch.float32)
+    if context.is_first_rank:
+        dhm = q.new_zeros(HV, K, V + K, dtype=torch.float32)
     else:
-        output = q.new_zeros(N, HV, K, V, dtype=torch.float32)
+        dhm = q.new_empty(HV, K, V + K, dtype=torch.float32)
+    if state_v_first:
+        output_shape = (N, HV, V, K)
+    else:
+        output_shape = (N, HV, K, V)
+    if context.is_last_rank or N != 1:
+        output = q.new_zeros(output_shape, dtype=torch.float32)
+    else:
+        output = q.new_empty(output_shape, dtype=torch.float32)
 
     if not context.is_first_rank:
         bos, eos = _segment_bounds(cu_seqlens, context, forward=False, fallback_t=T)
