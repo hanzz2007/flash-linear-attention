@@ -19,6 +19,7 @@ from fla.ops.cp import build_cp_context
 from fla.ops.cp.backends.triton_ascend.chunk_delta_h import (
     _backward_value_tile_size,
     _cp_gdn_bwd_dh_kernel,
+    _cp_gdn_bwd_fused_128_kernel,
     _cp_gdn_fwd_h_kernel,
     _launch_flat,
     _launch_gdn_transition,
@@ -255,14 +256,23 @@ def test_gdn_cp4_forward_preprocess(state_v_first: bool) -> None:
 
 @pytest.mark.skipif(not IS_NPU, reason='Triton-Ascend primitive test')
 @pytest.mark.parametrize(
-    ('K', 'V', 'chunk_size', 'segment_t', 'input_scale', 'check_states'),
+    ('K', 'V', 'chunk_size', 'segment_t', 'input_scale', 'check_states', 'dtype'),
     [
-        (96, 80, 32, 70, 0.05, True),
-        (256, 64, 16, 38, 0.05, True),
-        (32, 48, 32, 378, 0.05, True),
-        (128, 64, 32, 70, 0.2, False),
+        (96, 80, 32, 70, 0.05, True, torch.bfloat16),
+        (256, 64, 16, 38, 0.05, True, torch.bfloat16),
+        (32, 48, 32, 378, 0.05, True, torch.bfloat16),
+        (128, 64, 32, 70, 0.2, False, torch.bfloat16),
+        (128, 128, 64, 130, 0.05, True, torch.bfloat16),
+        (128, 128, 64, 130, 0.05, True, torch.float16),
     ],
-    ids=['k96-v80-tail', 'k256-v64-tail', 'long-serial-scan', 'transition-dot-range'],
+    ids=[
+        'k96-v80-tail',
+        'k256-v64-tail',
+        'long-serial-scan',
+        'transition-dot-range',
+        'fused-bwd-bf16-tail',
+        'fused-bwd-fp16-tail',
+    ],
 )
 def test_gdn_local_summaries_match_independent_reference(
     K: int,
@@ -271,9 +281,9 @@ def test_gdn_local_summaries_match_independent_reference(
     segment_t: int,
     input_scale: float,
     check_states: bool,
+    dtype: torch.dtype,
 ) -> None:
     """Cover non-zero BOS, tail chunks, GVA, K != V, and poisoned outputs."""
-    dtype = torch.bfloat16
     bos = 7
     total_t = bos + segment_t + 6
     H, HV = 1, 2
@@ -360,45 +370,65 @@ def test_gdn_local_summaries_match_independent_reference(
     )
 
     dhm = torch.full_like(hm, float('nan'))
-    bwd_bv = _backward_value_tile_size(K, V)
-    bwd_nv = (V + bwd_bv - 1) // bwd_bv
-    _launch_flat(
-        _cp_gdn_bwd_dh_kernel,
-        HV * bwd_nv,
-        q=q,
-        k=k,
-        w=w,
-        do=do,
-        dv=dv,
-        g=g,
-        dhm=dhm,
-        BOS=bos,
-        SEGMENT_T=segment_t,
-        NT=nt,
-        scale=scale,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BT=chunk_size,
-        BV=bwd_bv,
-        NV=bwd_nv,
-    )
-    _launch_gdn_transition(
-        summary=dhm,
-        k=k,
-        w=w,
-        g=g,
-        bos=bos,
-        segment_t=segment_t,
-        nt=nt,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        chunk_size=chunk_size,
-        forward=False,
-    )
+    if K == 128 and V == 128:
+        _launch_flat(
+            _cp_gdn_bwd_fused_128_kernel,
+            HV * 2,
+            q=q,
+            k=k,
+            w=w,
+            do=do,
+            dv=dv,
+            g=g,
+            dhm=dhm,
+            BOS=bos,
+            SEGMENT_T=segment_t,
+            NT=nt,
+            scale=scale,
+            H=H,
+            HV=HV,
+            BT=chunk_size,
+        )
+    else:
+        bwd_bv = _backward_value_tile_size(K, V)
+        bwd_nv = (V + bwd_bv - 1) // bwd_bv
+        _launch_flat(
+            _cp_gdn_bwd_dh_kernel,
+            HV * bwd_nv,
+            q=q,
+            k=k,
+            w=w,
+            do=do,
+            dv=dv,
+            g=g,
+            dhm=dhm,
+            BOS=bos,
+            SEGMENT_T=segment_t,
+            NT=nt,
+            scale=scale,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            BT=chunk_size,
+            BV=bwd_bv,
+            NV=bwd_nv,
+        )
+        _launch_gdn_transition(
+            summary=dhm,
+            k=k,
+            w=w,
+            g=g,
+            bos=bos,
+            segment_t=segment_t,
+            nt=nt,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            chunk_size=chunk_size,
+            forward=False,
+        )
     ref_dh = _reference_backward_state(
         q,
         k,

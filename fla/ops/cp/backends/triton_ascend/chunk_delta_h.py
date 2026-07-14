@@ -549,6 +549,111 @@ def _cp_gdn_bwd_m_kernel(
         tl.store(p_m, b_m4, mask=(k4 < K)[:, None] & m_m[None, :])
 
 
+@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT', 'scale'])
+def _cp_gdn_bwd_fused_128_kernel(
+    q,
+    k,
+    w,
+    do,
+    dv,
+    g,
+    dhm,
+    BOS,
+    SEGMENT_T,
+    NT,
+    scale,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    BT: tl.constexpr,
+    TASK_OFFSET: tl.constexpr,
+):
+    """Compute dH and dM together for the K=V=128 critical path."""
+    task = tl.program_id(0) + TASK_OFFSET
+    i_h = task // 2
+    i_c = task - i_h * 2
+    i_qh = i_h // (HV // H)
+
+    o_t = tl.arange(0, BT)
+    o_k = tl.arange(0, 64)
+    k1 = o_k
+    k2 = 64 + o_k
+    o_c = i_c * 64 + o_k
+
+    b_dh1 = tl.zeros([64, 64], dtype=tl.float32)
+    b_dh2 = tl.zeros([64, 64], dtype=tl.float32)
+    b_m1 = tl.where(k1[:, None] == o_c[None, :], 1.0, 0.0)
+    b_m2 = tl.where(k2[:, None] == o_c[None, :], 1.0, 0.0)
+
+    for step in tl.range(
+        0,
+        NT,
+        loop_unroll_factor=1,
+        disallow_acc_multi_buffer=True,
+    ):
+        i_t = NT - 1 - step
+        rel_t = i_t * BT + o_t
+        m_t = rel_t < SEGMENT_T
+        token = (BOS + rel_t).to(tl.int64)
+        last_rel = tl.minimum((i_t + 1) * BT, SEGMENT_T) - 1
+        last_token = (BOS + last_rel).to(tl.int64)
+        b_g_last = tl.load(g + last_token * HV + i_h).to(tl.float32)
+        b_g = tl.load(g + token * HV + i_h, mask=m_t, other=0.0).to(tl.float32)
+        b_rel = tl.where(m_t, exp2(b_g_last - b_g), 0.0)
+        b_gate = tl.where(m_t, exp2(b_g), 0.0)
+        b_decay = exp2(b_g_last)
+
+        p_k = k + token[:, None] * (H * 128) + i_qh * 128 + k1[None, :]
+        b_k1 = tl.load(p_k, mask=m_t[:, None], other=0.0)
+        p_k = k + token[:, None] * (H * 128) + i_qh * 128 + k2[None, :]
+        b_k2 = tl.load(p_k, mask=m_t[:, None], other=0.0)
+
+        b_dv = tl.dot(b_k1, b_dh1.to(b_k1.dtype), allow_tf32=False)
+        b_dv += tl.dot(b_k2, b_dh2.to(b_k2.dtype), allow_tf32=False)
+        b_dv *= b_rel[:, None]
+        p_dv = dv + token[:, None] * (HV * 128) + i_h * 128 + o_c[None, :]
+        b_dv += tl.load(p_dv, mask=m_t[:, None], other=0.0)
+
+        b_kg1 = (b_k1.to(tl.float32) * b_rel[:, None]).to(b_k1.dtype)
+        b_kg2 = (b_k2.to(tl.float32) * b_rel[:, None]).to(b_k2.dtype)
+        b_tmp = tl.dot(b_kg1.to(tl.float32), b_m1, allow_tf32=False)
+        b_tmp += tl.dot(b_kg2.to(tl.float32), b_m2, allow_tf32=False)
+
+        p_do = do + token[:, None] * (HV * 128) + i_h * 128 + o_c[None, :]
+        b_do = tl.load(p_do, mask=m_t[:, None], other=0.0)
+
+        p_q = q + token[None, :] * (H * 128) + i_qh * 128 + k1[:, None]
+        b_q1 = tl.load(p_q, mask=m_t[None, :], other=0.0)
+        p_q = q + token[None, :] * (H * 128) + i_qh * 128 + k2[:, None]
+        b_q2 = tl.load(p_q, mask=m_t[None, :], other=0.0)
+        b_qg1 = b_q1.to(tl.float32) * b_gate[None, :]
+        b_qg2 = b_q2.to(tl.float32) * b_gate[None, :]
+
+        p_w = w + token[None, :] * (HV * 128) + i_h * 128 + k1[:, None]
+        b_w1 = tl.load(p_w, mask=m_t[None, :], other=0.0)
+        p_w = w + token[None, :] * (HV * 128) + i_h * 128 + k2[:, None]
+        b_w2 = tl.load(p_w, mask=m_t[None, :], other=0.0)
+
+        b_dh1 *= b_decay
+        b_dh1 += _dot_fp32_low_rhs(b_qg1, b_do) * scale
+        b_dh1 -= tl.dot(b_w1, b_dv.to(b_w1.dtype), allow_tf32=False)
+        b_dh2 *= b_decay
+        b_dh2 += _dot_fp32_low_rhs(b_qg2, b_do) * scale
+        b_dh2 -= tl.dot(b_w2, b_dv.to(b_w2.dtype), allow_tf32=False)
+
+        b_m1 = b_decay * b_m1 - tl.dot(b_w1.to(tl.float32), b_tmp, allow_tf32=False)
+        b_m2 = b_decay * b_m2 - tl.dot(b_w2.to(tl.float32), b_tmp, allow_tf32=False)
+
+    dhm_base = (i_h * 128 * 256).to(tl.int64)
+    p_dh = dhm + dhm_base + k1[:, None] * 256 + o_c[None, :]
+    tl.store(p_dh, b_dh1)
+    p_dh = dhm + dhm_base + k2[:, None] * 256 + o_c[None, :]
+    tl.store(p_dh, b_dh2)
+    p_m = dhm + dhm_base + k1[:, None] * 256 + 128 + o_c[None, :]
+    tl.store(p_m, b_m1)
+    p_m = dhm + dhm_base + k2[:, None] * 256 + 128 + o_c[None, :]
+    tl.store(p_m, b_m2)
+
+
 def _launch_gdn_transition(
     *,
     summary: torch.Tensor,
@@ -1073,50 +1178,70 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
         segment_t = eos - bos
         nt = triton.cdiv(segment_t, chunk_size)
         if is_gdn:
-            current_stream = device_torch_lib.current_stream(q.device)
-            transition_stream = _summary_stream(q)
-            transition_stream.wait_stream(current_stream)
-            BV = _backward_value_tile_size(K, V)
-            NV = triton.cdiv(V, BV)
-            _launch_flat(
-                _cp_gdn_bwd_dh_kernel,
-                HV * NV,
-                q=q,
-                k=k,
-                w=w,
-                do=do,
-                dv=dv,
-                g=g,
-                dhm=dhm,
-                BOS=bos,
-                SEGMENT_T=segment_t,
-                NT=nt,
-                scale=scale,
-                H=H,
-                HV=HV,
-                K=K,
-                V=V,
-                BT=chunk_size,
-                BV=BV,
-                NV=NV,
-            )
-            with device_torch_lib.stream(transition_stream):
-                _launch_gdn_transition(
-                    summary=dhm,
+            if K == 128 and V == 128 and q.dtype in (torch.bfloat16, torch.float16):
+                _launch_flat(
+                    _cp_gdn_bwd_fused_128_kernel,
+                    HV * 2,
+                    q=q,
                     k=k,
                     w=w,
+                    do=do,
+                    dv=dv,
                     g=g,
-                    bos=bos,
-                    segment_t=segment_t,
-                    nt=nt,
+                    dhm=dhm,
+                    BOS=bos,
+                    SEGMENT_T=segment_t,
+                    NT=nt,
+                    scale=scale,
+                    H=H,
+                    HV=HV,
+                    BT=chunk_size,
+                )
+            else:
+                current_stream = device_torch_lib.current_stream(q.device)
+                transition_stream = _summary_stream(q)
+                transition_stream.wait_stream(current_stream)
+                BV = _backward_value_tile_size(K, V)
+                NV = triton.cdiv(V, BV)
+                _launch_flat(
+                    _cp_gdn_bwd_dh_kernel,
+                    HV * NV,
+                    q=q,
+                    k=k,
+                    w=w,
+                    do=do,
+                    dv=dv,
+                    g=g,
+                    dhm=dhm,
+                    BOS=bos,
+                    SEGMENT_T=segment_t,
+                    NT=nt,
+                    scale=scale,
                     H=H,
                     HV=HV,
                     K=K,
                     V=V,
-                    chunk_size=chunk_size,
-                    forward=False,
+                    BT=chunk_size,
+                    BV=BV,
+                    NV=NV,
                 )
-            current_stream.wait_stream(transition_stream)
+                with device_torch_lib.stream(transition_stream):
+                    _launch_gdn_transition(
+                        summary=dhm,
+                        k=k,
+                        w=w,
+                        g=g,
+                        bos=bos,
+                        segment_t=segment_t,
+                        nt=nt,
+                        H=H,
+                        HV=HV,
+                        K=K,
+                        V=V,
+                        chunk_size=chunk_size,
+                        forward=False,
+                    )
+                current_stream.wait_stream(transition_stream)
         else:
             dhm = _local_bwd_summary_torch(
                 q=q,
