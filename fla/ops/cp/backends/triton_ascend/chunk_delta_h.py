@@ -108,6 +108,35 @@ def _cp_gdn_gate_factors_kernel(
     tl.store(gate_decay + i_t * HV + i_h, exp2(b_g_last))
 
 
+@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T'])
+def _cp_gdn_bwd_gate_factors_kernel(
+    g,
+    gate_rel,
+    gate_abs,
+    gate_decay,
+    BOS,
+    SEGMENT_T,
+    HV: tl.constexpr,
+    BT: tl.constexpr,
+    NT: tl.constexpr,
+    TASK_OFFSET: tl.constexpr,
+):
+    task = tl.program_id(0) + TASK_OFFSET
+    i_h = task // NT
+    i_t = task - i_h * NT
+    o_t = tl.arange(0, BT)
+    rel_t = i_t * BT + o_t
+    m_t = rel_t < SEGMENT_T
+    token = (BOS + rel_t).to(tl.int64)
+    last_rel = tl.minimum((i_t + 1) * BT, SEGMENT_T) - 1
+    last_token = (BOS + last_rel).to(tl.int64)
+    b_g_last = tl.load(g + last_token * HV + i_h).to(tl.float32)
+    b_g = tl.load(g + token * HV + i_h, mask=m_t, other=0.0).to(tl.float32)
+    tl.store(gate_rel + rel_t * HV + i_h, exp2(b_g_last - b_g), mask=m_t)
+    tl.store(gate_abs + rel_t * HV + i_h, exp2(b_g), mask=m_t)
+    tl.store(gate_decay + i_t * HV + i_h, exp2(b_g_last))
+
+
 @triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT'])
 def _cp_gdn_fwd_h_kernel(
     k,
@@ -599,6 +628,9 @@ def _cp_gdn_bwd_fused_128_kernel(
     do,
     dv,
     g,
+    gate_rel,
+    gate_abs,
+    gate_decay,
     dhm,
     BOS,
     SEGMENT_T,
@@ -607,6 +639,7 @@ def _cp_gdn_bwd_fused_128_kernel(
     H: tl.constexpr,
     HV: tl.constexpr,
     BT: tl.constexpr,
+    PRECOMPUTED_GATE: tl.constexpr,
     TASK_OFFSET: tl.constexpr,
 ):
     """Compute dH and dM together for the K=V=128 critical path."""
@@ -636,13 +669,18 @@ def _cp_gdn_bwd_fused_128_kernel(
         rel_t = i_t * BT + o_t
         m_t = rel_t < SEGMENT_T
         token = (BOS + rel_t).to(tl.int64)
-        last_rel = tl.minimum((i_t + 1) * BT, SEGMENT_T) - 1
-        last_token = (BOS + last_rel).to(tl.int64)
-        b_g_last = tl.load(g + last_token * HV + i_h).to(tl.float32)
-        b_g = tl.load(g + token * HV + i_h, mask=m_t, other=0.0).to(tl.float32)
-        b_rel = tl.where(m_t, exp2(b_g_last - b_g), 0.0)
-        b_gate = tl.where(m_t, exp2(b_g), 0.0)
-        b_decay = exp2(b_g_last)
+        if PRECOMPUTED_GATE:
+            b_rel = tl.load(gate_rel + rel_t * HV + i_h, mask=m_t, other=0.0)
+            b_gate = tl.load(gate_abs + rel_t * HV + i_h, mask=m_t, other=0.0)
+            b_decay = tl.load(gate_decay + i_t * HV + i_h)
+        else:
+            last_rel = tl.minimum((i_t + 1) * BT, SEGMENT_T) - 1
+            last_token = (BOS + last_rel).to(tl.int64)
+            b_g_last = tl.load(g + last_token * HV + i_h).to(tl.float32)
+            b_g = tl.load(g + token * HV + i_h, mask=m_t, other=0.0).to(tl.float32)
+            b_rel = tl.where(m_t, exp2(b_g_last - b_g), 0.0)
+            b_gate = tl.where(m_t, exp2(b_g), 0.0)
+            b_decay = exp2(b_g_last)
 
         p_k = k + token[:, None] * (H * 128) + i_qh * 128 + k1[None, :]
         b_k1 = tl.load(p_k, mask=m_t[:, None], other=0.0)
@@ -1307,6 +1345,22 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
         nt = triton.cdiv(segment_t, chunk_size)
         if is_gdn:
             if K == 128 and V == 128 and q.dtype in (torch.bfloat16, torch.float16):
+                gate_rel = torch.empty((segment_t, HV), device=q.device, dtype=torch.float32)
+                gate_abs = torch.empty((segment_t, HV), device=q.device, dtype=torch.float32)
+                gate_decay = torch.empty((nt, HV), device=q.device, dtype=torch.float32)
+                _launch_flat(
+                    _cp_gdn_bwd_gate_factors_kernel,
+                    HV * nt,
+                    g=g,
+                    gate_rel=gate_rel,
+                    gate_abs=gate_abs,
+                    gate_decay=gate_decay,
+                    BOS=bos,
+                    SEGMENT_T=segment_t,
+                    HV=HV,
+                    BT=chunk_size,
+                    NT=nt,
+                )
                 _launch_flat(
                     _cp_gdn_bwd_fused_128_kernel,
                     HV * 2,
@@ -1316,6 +1370,9 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
                     do=do,
                     dv=dv,
                     g=g,
+                    gate_rel=gate_rel,
+                    gate_abs=gate_abs,
+                    gate_decay=gate_decay,
                     dhm=dhm,
                     BOS=bos,
                     SEGMENT_T=segment_t,
@@ -1324,6 +1381,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
                     H=H,
                     HV=HV,
                     BT=chunk_size,
+                    PRECOMPUTED_GATE=True,
                 )
             else:
                 current_stream = device_torch_lib.current_stream(q.device)

@@ -20,6 +20,7 @@ from fla.ops.cp.backends.triton_ascend.chunk_delta_h import (
     _backward_value_tile_size,
     _cp_gdn_bwd_dh_kernel,
     _cp_gdn_bwd_fused_128_kernel,
+    _cp_gdn_bwd_gate_factors_kernel,
     _cp_gdn_fwd_h_kernel,
     _cp_gdn_gate_factors_kernel,
     _launch_flat,
@@ -441,6 +442,9 @@ def test_gdn_local_summaries_match_independent_reference(
             do=do,
             dv=dv,
             g=g,
+            gate_rel=g,
+            gate_abs=g,
+            gate_decay=g,
             dhm=dhm,
             BOS=bos,
             SEGMENT_T=segment_t,
@@ -449,6 +453,7 @@ def test_gdn_local_summaries_match_independent_reference(
             H=H,
             HV=HV,
             BT=chunk_size,
+            PRECOMPUTED_GATE=False,
         )
     else:
         bwd_bv = _backward_value_tile_size(K, V)
@@ -490,6 +495,48 @@ def test_gdn_local_summaries_match_independent_reference(
             chunk_size=chunk_size,
             forward=False,
         )
+
+    precomputed_dhm = None
+    if K == 128 and V == 128:
+        bwd_gate_rel = torch.full((segment_t, HV), float('nan'), dtype=torch.float32, device=device_obj)
+        gate_abs = torch.full((segment_t, HV), float('nan'), dtype=torch.float32, device=device_obj)
+        bwd_gate_decay = torch.full((nt, HV), float('nan'), dtype=torch.float32, device=device_obj)
+        _launch_flat(
+            _cp_gdn_bwd_gate_factors_kernel,
+            HV * nt,
+            g=g,
+            gate_rel=bwd_gate_rel,
+            gate_abs=gate_abs,
+            gate_decay=bwd_gate_decay,
+            BOS=bos,
+            SEGMENT_T=segment_t,
+            HV=HV,
+            BT=chunk_size,
+            NT=nt,
+        )
+        precomputed_dhm = torch.full_like(dhm, float('nan'))
+        _launch_flat(
+            _cp_gdn_bwd_fused_128_kernel,
+            HV * 2,
+            q=q,
+            k=k,
+            w=w,
+            do=do,
+            dv=dv,
+            g=g,
+            gate_rel=bwd_gate_rel,
+            gate_abs=gate_abs,
+            gate_decay=bwd_gate_decay,
+            dhm=precomputed_dhm,
+            BOS=bos,
+            SEGMENT_T=segment_t,
+            NT=nt,
+            scale=scale,
+            H=H,
+            HV=HV,
+            BT=chunk_size,
+            PRECOMPUTED_GATE=True,
+        )
     ref_dh = _reference_backward_state(
         q,
         k,
@@ -523,6 +570,12 @@ def test_gdn_local_summaries_match_independent_reference(
         checked += (
             ('precomputed H', ref_h, precomputed_hm[:, :, :V]),
             ('precomputed M', ref_m, precomputed_hm[:, :, V:]),
+        )
+    if precomputed_dhm is not None:
+        assert torch.isfinite(precomputed_dhm).all().item()
+        checked += (
+            ('precomputed dH', ref_dh, precomputed_dhm[:, :, :V]),
+            ('precomputed dM', ref_dm, precomputed_dhm[:, :, V:]),
         )
     if check_states:
         checked += (
