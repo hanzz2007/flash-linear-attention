@@ -63,6 +63,7 @@ Test Scenarios:
 import logging
 import os
 import socket
+from datetime import timedelta
 
 import pytest
 import torch
@@ -72,10 +73,26 @@ import torch.nn.functional as F
 
 from fla.ops.cp import build_cp_context
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-from fla.utils import IS_NPU, assert_close, device, device_torch_lib
+from fla.utils import IS_NPU, device, device_torch_lib
 
 # Configure logging to see assert_close messages
 logging.basicConfig(level=logging.INFO, format='%(message)s')
+
+
+def assert_strict_close(name: str, reference: torch.Tensor, actual: torch.Tensor, ratio: float) -> None:
+    """Assert finite results without the CI warning downgrade in ``assert_close``."""
+    assert torch.isfinite(reference).all().item(), f'{name}: non-finite reference'
+    assert torch.isfinite(actual).all().item(), f'{name}: non-finite result'
+    reference = reference.detach().float()
+    actual = actual.detach().float()
+    max_abs = (reference - actual).abs().max().item()
+    rms = (reference - actual).square().mean().sqrt()
+    base = reference.square().mean().sqrt()
+    error_ratio = (rms / (base + 1e-8)).item()
+    logging.info(f'{name:>16} diff: {max_abs:.6f} ratio: {error_ratio:.6f}')
+    assert max_abs <= 1e-6 or error_ratio < ratio, (
+        f'{name}: max_abs={max_abs:.6g}, ratio={error_ratio:.6g}, limit={ratio:.6g}'
+    )
 
 
 def init_distributed(rank, world_size, port):
@@ -87,11 +104,27 @@ def init_distributed(rank, world_size, port):
     os.environ['RANK'] = str(rank)
     os.environ['WORLD_SIZE'] = str(world_size)
     os.environ['LOCAL_RANK'] = str(rank)
+    # Triton-Ascend 3.2 can race while spawned ranks publish one cache entry.
+    # A persistent directory per physical device is race-free and preserves
+    # compiled artifacts across parametrized tests.
+    visible_var = 'ASCEND_RT_VISIBLE_DEVICES' if IS_NPU else 'CUDA_VISIBLE_DEVICES'
+    visible_devices = os.environ.get(visible_var, '').split(',')
+    device_key = visible_devices[rank].strip() if len(visible_devices) > rank else str(rank)
+    os.environ['TRITON_CACHE_DIR'] = f'/tmp/fla-triton-cache-{device}-{device_key}'
     if IS_NPU:
         os.environ.setdefault('HCCL_NPU_SOCKET_PORT_RANGE', 'auto')
+        # Rank 0 compiles and runs the full-sequence reference before the
+        # other ranks reach their first post-reference collective. Keep the
+        # documented connect timeout above that one-time compile window.
+        os.environ.setdefault('HCCL_CONNECT_TIMEOUT', '600')
 
-    dist.init_process_group(backend='hccl' if IS_NPU else 'nccl', rank=rank, world_size=world_size)
     device_torch_lib.set_device(rank)
+    dist.init_process_group(
+        backend='hccl' if IS_NPU else 'nccl',
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(minutes=20),
+    )
 
 
 def cleanup_distributed():
@@ -111,6 +144,9 @@ def run_cp_gdn_test_worker(
     dtype,
     state_v_first: bool = False,
     Hq: int | None = None,
+    Dv: int | None = None,
+    op_chunk_size: int = 64,
+    fused_inputs: bool = False,
     port: int = 29502,
 ):
     """
@@ -134,23 +170,33 @@ def run_cp_gdn_test_worker(
         # Step 1: Prepare Global Data (all generated on rank 0, broadcast to all)
         B = 1
         Hq_actual = Hq if Hq is not None else H
+        Dv_actual = Dv if Dv is not None else D
         q_global = torch.empty(B, T, Hq_actual, D, device=worker_device, dtype=dtype)
         k_global = torch.empty(B, T, Hq_actual, D, device=worker_device, dtype=dtype)
-        v_global = torch.empty(B, T, H, D, device=worker_device, dtype=dtype)
+        v_global = torch.empty(B, T, H, Dv_actual, device=worker_device, dtype=dtype)
         g_global = torch.empty(B, T, H, device=worker_device, dtype=dtype)
         beta_global = torch.empty(B, T, H, device=worker_device, dtype=torch.float32)
-        do_global = torch.empty(B, T, H, D, device=worker_device, dtype=dtype)
+        do_global = torch.empty(B, T, H, Dv_actual, device=worker_device, dtype=dtype)
+        A_log = torch.empty(H, device=worker_device, dtype=torch.float32)
+        dt_bias = torch.empty(H, device=worker_device, dtype=torch.float32)
 
         if rank == 0:
             torch.manual_seed(42)
-            q_global.copy_(F.normalize(torch.randn(B, T, Hq_actual, D, device=worker_device,
-                           dtype=torch.float32), p=2, dim=-1).to(dtype))
-            k_global.copy_(F.normalize(torch.randn(B, T, Hq_actual, D, device=worker_device,
-                           dtype=torch.float32), p=2, dim=-1).to(dtype))
-            v_global.copy_(torch.randn(B, T, H, D, device=worker_device, dtype=dtype))
-            g_global.copy_(F.logsigmoid(torch.randn(B, T, H, device=worker_device, dtype=dtype)))
-            beta_global.copy_(torch.randn(B, T, H, device=worker_device, dtype=torch.float32).sigmoid())
-            do_global.copy_(torch.randn(B, T, H, D, device=worker_device, dtype=dtype))
+            q_data = torch.randn(B, T, Hq_actual, D, device=worker_device, dtype=torch.float32)
+            k_data = torch.randn(B, T, Hq_actual, D, device=worker_device, dtype=torch.float32)
+            if not fused_inputs:
+                q_data = F.normalize(q_data, p=2, dim=-1)
+                k_data = F.normalize(k_data, p=2, dim=-1)
+            q_global.copy_(q_data.to(dtype))
+            k_global.copy_(k_data.to(dtype))
+            v_global.copy_(torch.randn(B, T, H, Dv_actual, device=worker_device, dtype=dtype))
+            g_data = torch.randn(B, T, H, device=worker_device, dtype=dtype)
+            beta_data = torch.randn(B, T, H, device=worker_device, dtype=torch.float32)
+            g_global.copy_(g_data if fused_inputs else F.logsigmoid(g_data))
+            beta_global.copy_(beta_data if fused_inputs else beta_data.sigmoid())
+            do_global.copy_(torch.randn(B, T, H, Dv_actual, device=worker_device, dtype=dtype))
+            A_log.copy_(torch.linspace(-0.3, 0.2, H, device=worker_device))
+            dt_bias.copy_(torch.linspace(-0.2, 0.1, H, device=worker_device))
 
         # Broadcast to ensure all ranks have same data
         dist.broadcast(q_global, src=0)
@@ -159,6 +205,8 @@ def run_cp_gdn_test_worker(
         dist.broadcast(g_global, src=0)
         dist.broadcast(beta_global, src=0)
         dist.broadcast(do_global, src=0)
+        dist.broadcast(A_log, src=0)
+        dist.broadcast(dt_bias, src=0)
 
         # Prepare cu_seqlens
         cu_seqlens_list = [0] + torch.cumsum(torch.tensor(lengths), 0).tolist()
@@ -183,6 +231,12 @@ def run_cp_gdn_test_worker(
                 beta=beta_ref,
                 cu_seqlens=cu_seqlens_global,
                 state_v_first=state_v_first,
+                chunk_size=op_chunk_size,
+                use_qk_l2norm_in_kernel=fused_inputs,
+                use_gate_in_kernel=fused_inputs,
+                A_log=A_log if fused_inputs else None,
+                dt_bias=dt_bias if fused_inputs else None,
+                use_beta_sigmoid_in_kernel=fused_inputs,
             )
 
             o_ref.backward(do_global)
@@ -199,9 +253,9 @@ def run_cp_gdn_test_worker(
 
         context = build_cp_context(cu_seqlens_global, group=dist.group.WORLD)
 
-        chunk_size = T // world_size
-        start_idx = rank * chunk_size
-        end_idx = (rank + 1) * chunk_size
+        rank_seq_len = T // world_size
+        start_idx = rank * rank_seq_len
+        end_idx = (rank + 1) * rank_seq_len
 
         # Get local slices - note: g is [B, T, H], beta is [B, T, H]
         q_local = q_global[:, start_idx:end_idx, :].clone().detach().requires_grad_(True)
@@ -225,6 +279,12 @@ def run_cp_gdn_test_worker(
             beta=beta_local,
             cp_context=context,
             state_v_first=state_v_first,
+            chunk_size=op_chunk_size,
+            use_qk_l2norm_in_kernel=fused_inputs,
+            use_gate_in_kernel=fused_inputs,
+            A_log=A_log if fused_inputs else None,
+            dt_bias=dt_bias if fused_inputs else None,
+            use_beta_sigmoid_in_kernel=fused_inputs,
         )
 
         # CP Backward
@@ -270,7 +330,7 @@ def run_cp_gdn_test_worker(
 
             try:
                 for name, ref, cp in tensors_to_verify:
-                    assert_close(name, ref, cp, ratio=3e-3, warning=False)
+                    assert_strict_close(name, ref, cp, ratio=3e-3)
                 print(f"[{test_name}] Test Passed!\n")
             except AssertionError as e:
                 print(f"[{test_name}] Test Failed: {e}\n")
@@ -297,6 +357,9 @@ def run_cp_test_with_spawn(
     dtype=torch.bfloat16,
     state_v_first: bool = False,
     Hq: int | None = None,
+    Dv: int | None = None,
+    op_chunk_size: int = 64,
+    fused_inputs: bool = False,
 ):
     """
     Run CP test using torch.multiprocessing.spawn.
@@ -307,7 +370,10 @@ def run_cp_test_with_spawn(
         port = sock.getsockname()[1]
     mp.start_processes(
         run_cp_gdn_test_worker,
-        args=(world_size, test_name, T, H, D, lengths, dtype, state_v_first, Hq, port),
+        args=(
+            world_size, test_name, T, H, D, lengths, dtype, state_v_first,
+            Hq, Dv, op_chunk_size, fused_inputs, port,
+        ),
         nprocs=world_size,
         join=True,
         start_method='spawn',
@@ -427,6 +493,51 @@ def test_cp2_gqa_single_sequence():
         T=10240, H=8, D=64, Hq=2,
         lengths=[10240],
         dtype=torch.bfloat16,
+    )
+
+
+def test_cp2_k256_value64_tail():
+    """CP2: K=256, K != V, and partial boundary chunks."""
+    if device_torch_lib.device_count() < 2:
+        pytest.skip("At least 2 GPUs required")
+
+    run_cp_test_with_spawn(
+        world_size=2,
+        test_name="CP2_K256_Value64_Tail",
+        T=4224, H=2, D=256, Dv=64,
+        lengths=[3001, 1223],
+        dtype=torch.bfloat16,
+    )
+
+
+def test_cp2_fp16_chunk16_gva_tail():
+    """CP2: FP16, BT=16, GVA, K != V, and two partial sequences."""
+    if device_torch_lib.device_count() < 2:
+        pytest.skip("At least 2 GPUs required")
+
+    run_cp_test_with_spawn(
+        world_size=2,
+        test_name="CP2_FP16_Chunk16_GVA_Tail",
+        T=1088, H=2, D=96, Hq=1, Dv=80,
+        lengths=[701, 387],
+        dtype=torch.float16,
+        op_chunk_size=16,
+    )
+
+
+def test_cp2_fused_gate_beta_qk_norm():
+    """CP2: fused raw gate, beta sigmoid, and q/k normalization paths."""
+    if device_torch_lib.device_count() < 2:
+        pytest.skip("At least 2 GPUs required")
+
+    run_cp_test_with_spawn(
+        world_size=2,
+        test_name="CP2_Fused_Gate_Beta_QKNorm",
+        T=2048, H=2, D=64,
+        lengths=[1301, 747],
+        dtype=torch.bfloat16,
+        op_chunk_size=32,
+        fused_inputs=True,
     )
 
 

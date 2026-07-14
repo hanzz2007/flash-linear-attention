@@ -17,6 +17,7 @@ import os
 import statistics
 import time
 from contextlib import suppress
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -149,7 +150,7 @@ def _run_once(
     inputs: tuple[torch.Tensor, ...],
     do: torch.Tensor,
     cp_context,
-) -> None:
+) -> torch.Tensor:
     for tensor in inputs:
         tensor.grad = None
     q, k, v, g, beta = inputs
@@ -165,6 +166,7 @@ def _run_once(
     )
     if args.mode == "fwd_bwd":
         output.backward(do)
+    return output
 
 
 def _measure(
@@ -175,8 +177,18 @@ def _measure(
     device_obj: torch.device,
 ) -> tuple[list[float], int]:
     # Compile or load every kernel before warmup and formal timing.
-    _run_once(args, inputs, do, cp_context)
+    result = _run_once(args, inputs, do, cp_context)
     _synchronize()
+    tensors = [result]
+    if args.mode == "fwd_bwd":
+        tensors.extend(tensor.grad for tensor in inputs)
+    finite = torch.tensor(
+        float(all(torch.isfinite(tensor).all().item() for tensor in tensors)),
+        device=device_obj,
+    )
+    dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+    if not finite.item():
+        raise AssertionError("GDN CP benchmark produced a non-finite output or gradient")
     dist.barrier()
 
     for _ in range(args.warmup):
@@ -206,13 +218,17 @@ def _measure(
 
 def main() -> None:
     args = _parse_args()
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+    visible_var = "ASCEND_RT_VISIBLE_DEVICES" if IS_NPU else "CUDA_VISIBLE_DEVICES"
+    visible_devices = os.environ.get(visible_var, "").split(",")
+    device_key = visible_devices[local_rank].strip() if len(visible_devices) > local_rank else str(local_rank)
+    os.environ.setdefault("TRITON_CACHE_DIR", f"/tmp/fla-triton-cache-{device}-{device_key}")
     backend = "hccl" if IS_NPU else "nccl"
     if IS_NPU:
         os.environ.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "auto")
-    dist.init_process_group(backend=backend)
+    dist.init_process_group(backend=backend, timeout=timedelta(minutes=20))
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
     device_torch_lib.set_device(local_rank)
     device_obj = torch.device(device, local_rank)
 
