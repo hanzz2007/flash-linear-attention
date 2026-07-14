@@ -644,6 +644,91 @@ def _cp_merge_one_rank_kernel(
     tl.store(p_out, b_out, mask=m_r[:, None] & m_v[None, :])
 
 
+@triton.jit(do_not_specialize=['SOURCE_START', 'SOURCE_STEP'])
+def _cp_merge_rank_chain_kernel(
+    ag_hm,
+    state_out,
+    SOURCE_START,
+    SOURCE_STEP,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    NV: tl.constexpr,
+    NUM_RANKS: tl.constexpr,
+    OUTPUT_V_FIRST: tl.constexpr,
+    TASK_OFFSET: tl.constexpr,
+):
+    """Compose the ordered rank chain without intermediate HBM states."""
+    task = tl.program_id(0) + TASK_OFFSET
+    i_h = task // NV
+    i_v = task - i_h * NV
+
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_v = o_v < V
+    o_k = tl.arange(0, 64)
+    k1 = o_k
+    if K > 64:
+        k2 = 64 + o_k
+
+    source_rank = SOURCE_START
+    rank_base = (source_rank.to(tl.int64) * HV * K * (V + K) + i_h * K * (V + K))
+    p_h = ag_hm + rank_base + k1[:, None] * (V + K) + o_v[None, :]
+    b_state1 = tl.load(p_h, mask=(k1 < K)[:, None] & m_v[None, :], other=0.0).to(tl.float32)
+    if K > 64:
+        p_h = ag_hm + rank_base + k2[:, None] * (V + K) + o_v[None, :]
+        b_state2 = tl.load(p_h, mask=(k2 < K)[:, None] & m_v[None, :], other=0.0).to(tl.float32)
+
+    for i_rank in tl.range(
+        1,
+        NUM_RANKS,
+        loop_unroll_factor=1,
+        disallow_acc_multi_buffer=True,
+    ):
+        source_rank = SOURCE_START + i_rank * SOURCE_STEP
+        rank_base = (source_rank.to(tl.int64) * HV * K * (V + K) + i_h * K * (V + K))
+
+        p_m = ag_hm + rank_base + k1[:, None] * (V + K) + V + k1[None, :]
+        b_m = tl.load(p_m, mask=(k1 < K)[:, None] & (k1 < K)[None, :], other=0.0).to(tl.float32)
+        b_next1 = tl.dot(b_m, b_state1, allow_tf32=False)
+        if K > 64:
+            p_m = ag_hm + rank_base + k1[:, None] * (V + K) + V + k2[None, :]
+            b_m = tl.load(p_m, mask=(k1 < K)[:, None] & (k2 < K)[None, :], other=0.0).to(tl.float32)
+            b_next1 += tl.dot(b_m, b_state2, allow_tf32=False)
+        p_h = ag_hm + rank_base + k1[:, None] * (V + K) + o_v[None, :]
+        b_next1 += tl.load(p_h, mask=(k1 < K)[:, None] & m_v[None, :], other=0.0).to(tl.float32)
+
+        if K > 64:
+            p_m = ag_hm + rank_base + k2[:, None] * (V + K) + V + k1[None, :]
+            b_m = tl.load(p_m, mask=(k2 < K)[:, None] & (k1 < K)[None, :], other=0.0).to(tl.float32)
+            b_next2 = tl.dot(b_m, b_state1, allow_tf32=False)
+            p_m = ag_hm + rank_base + k2[:, None] * (V + K) + V + k2[None, :]
+            b_m = tl.load(p_m, mask=(k2 < K)[:, None] & (k2 < K)[None, :], other=0.0).to(tl.float32)
+            b_next2 += tl.dot(b_m, b_state2, allow_tf32=False)
+            p_h = ag_hm + rank_base + k2[:, None] * (V + K) + o_v[None, :]
+            b_next2 += tl.load(p_h, mask=(k2 < K)[:, None] & m_v[None, :], other=0.0).to(tl.float32)
+
+        b_state1 = b_next1
+        if K > 64:
+            b_state2 = b_next2
+
+    if OUTPUT_V_FIRST:
+        out_base = (i_h * V * K).to(tl.int64)
+        p_out = state_out + out_base + o_v[:, None] * K + k1[None, :]
+        tl.store(p_out, tl.trans(b_state1), mask=m_v[:, None] & (k1 < K)[None, :])
+    else:
+        out_base = (i_h * K * V).to(tl.int64)
+        p_out = state_out + out_base + k1[:, None] * V + o_v[None, :]
+        tl.store(p_out, b_state1, mask=(k1 < K)[:, None] & m_v[None, :])
+    if K > 64:
+        if OUTPUT_V_FIRST:
+            p_out = state_out + out_base + o_v[:, None] * K + k2[None, :]
+            tl.store(p_out, tl.trans(b_state2), mask=m_v[:, None] & (k2 < K)[None, :])
+        else:
+            p_out = state_out + out_base + k2[:, None] * V + o_v[None, :]
+            tl.store(p_out, b_state2, mask=(k2 < K)[:, None] & m_v[None, :])
+
+
 def _segment_bounds(
     cu_seqlens: torch.LongTensor | None,
     context: FLACPContext,
@@ -775,6 +860,27 @@ def _merge_rank_chain(
     V: int,
 ) -> None:
     if not ranks:
+        return
+    if K <= 128 and not state_v_first:
+        BV = 128
+        NV = triton.cdiv(V, BV)
+        source_step = 1 if len(ranks) == 1 else ranks[1] - ranks[0]
+        assert all(right - left == source_step for left, right in zip(ranks[:-1], ranks[1:], strict=True))
+        _launch_flat(
+            _cp_merge_rank_chain_kernel,
+            HV * NV,
+            ag_hm=ag_hm,
+            state_out=output,
+            SOURCE_START=ranks[0],
+            SOURCE_STEP=source_step,
+            HV=HV,
+            K=K,
+            V=V,
+            BV=BV,
+            NV=NV,
+            NUM_RANKS=len(ranks),
+            OUTPUT_V_FIRST=state_v_first,
+        )
         return
     BR = 16
     BV = 16
