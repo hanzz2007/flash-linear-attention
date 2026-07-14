@@ -123,6 +123,8 @@ def _run_local_kernel(args: argparse.Namespace, inputs, scratch: torch.Tensor) -
                 w=w,
                 u=u,
                 g=g,
+                gate_rel=g,
+                gate_decay=g,
                 hm=scratch,
                 BOS=0,
                 SEGMENT_T=local_seq_len,
@@ -134,6 +136,7 @@ def _run_local_kernel(args: argparse.Namespace, inputs, scratch: torch.Tensor) -
                 BT=args.chunk_size,
                 BV=bv,
                 NV=nv,
+                PRECOMPUTED_GATE=False,
             )
         else:
             _launch_flat(

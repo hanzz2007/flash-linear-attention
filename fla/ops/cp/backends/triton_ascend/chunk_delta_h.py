@@ -80,12 +80,42 @@ def _dot_fp32_low_rhs(lhs, rhs):
     return tl.dot(lhs_hi, rhs, allow_tf32=False) + tl.dot(lhs_lo, rhs, allow_tf32=False)
 
 
+@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T'])
+def _cp_gdn_gate_factors_kernel(
+    g,
+    gate_rel,
+    gate_decay,
+    BOS,
+    SEGMENT_T,
+    HV: tl.constexpr,
+    BT: tl.constexpr,
+    NT: tl.constexpr,
+    TASK_OFFSET: tl.constexpr,
+):
+    task = tl.program_id(0) + TASK_OFFSET
+    i_h = task // NT
+    i_t = task - i_h * NT
+    o_t = tl.arange(0, BT)
+    rel_t = i_t * BT + o_t
+    m_t = rel_t < SEGMENT_T
+    token = (BOS + rel_t).to(tl.int64)
+    last_rel = tl.minimum((i_t + 1) * BT, SEGMENT_T) - 1
+    last_token = (BOS + last_rel).to(tl.int64)
+    b_g_last = tl.load(g + last_token * HV + i_h).to(tl.float32)
+    b_g = tl.load(g + token * HV + i_h, mask=m_t, other=0.0).to(tl.float32)
+    b_rel = tl.where(m_t, exp2(b_g_last - b_g), 0.0)
+    tl.store(gate_rel + rel_t * HV + i_h, b_rel, mask=m_t)
+    tl.store(gate_decay + i_t * HV + i_h, exp2(b_g_last))
+
+
 @triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT'])
 def _cp_gdn_fwd_h_kernel(
     k,
     w,
     u,
     g,
+    gate_rel,
+    gate_decay,
     hm,
     BOS,
     SEGMENT_T,
@@ -97,6 +127,7 @@ def _cp_gdn_fwd_h_kernel(
     BT: tl.constexpr,
     BV: tl.constexpr,
     NV: tl.constexpr,
+    PRECOMPUTED_GATE: tl.constexpr,
     TASK_OFFSET: tl.constexpr,
 ):
     task = tl.program_id(0) + TASK_OFFSET
@@ -153,13 +184,17 @@ def _cp_gdn_fwd_h_kernel(
         p_u = u + token[:, None] * (HV * V) + i_h * V + o_v[None, :]
         b_v = tl.load(p_u, mask=m_t[:, None] & m_v[None, :], other=0.0) - b_v_decay
 
-        last_rel = tl.minimum((i_t + 1) * BT, SEGMENT_T) - 1
-        last_token = (BOS + last_rel).to(tl.int64)
-        b_g_last = tl.load(g + last_token * HV + i_h).to(tl.float32)
-        b_g = tl.load(g + token * HV + i_h, mask=m_t, other=0.0).to(tl.float32)
-        b_rel = tl.where(m_t, exp2(b_g_last - b_g), 0.0)
+        if PRECOMPUTED_GATE:
+            b_rel = tl.load(gate_rel + rel_t * HV + i_h, mask=m_t, other=0.0)
+            b_decay = tl.load(gate_decay + i_t * HV + i_h)
+        else:
+            last_rel = tl.minimum((i_t + 1) * BT, SEGMENT_T) - 1
+            last_token = (BOS + last_rel).to(tl.int64)
+            b_g_last = tl.load(g + last_token * HV + i_h).to(tl.float32)
+            b_g = tl.load(g + token * HV + i_h, mask=m_t, other=0.0).to(tl.float32)
+            b_rel = tl.where(m_t, exp2(b_g_last - b_g), 0.0)
+            b_decay = exp2(b_g_last)
         b_v *= b_rel[:, None]
-        b_decay = exp2(b_g_last)
         b_h1 *= b_decay
         if K > 64:
             b_h2 *= b_decay
@@ -204,6 +239,8 @@ def _cp_gdn_fwd_m_kernel(
     k,
     w,
     g,
+    gate_rel,
+    gate_decay,
     hm,
     BOS,
     SEGMENT_T,
@@ -215,6 +252,7 @@ def _cp_gdn_fwd_m_kernel(
     BT: tl.constexpr,
     BM: tl.constexpr,
     NM: tl.constexpr,
+    PRECOMPUTED_GATE: tl.constexpr,
     TASK_OFFSET: tl.constexpr,
 ):
     task = tl.program_id(0) + TASK_OFFSET
@@ -265,12 +303,16 @@ def _cp_gdn_fwd_m_kernel(
             b_w = tl.load(p_w, mask=m_t[:, None] & (k4 < K)[None, :], other=0.0)
             b_tmp += tl.dot(b_w.to(tl.float32), b_m4, allow_tf32=False)
 
-        last_rel = tl.minimum((i_t + 1) * BT, SEGMENT_T) - 1
-        last_token = (BOS + last_rel).to(tl.int64)
-        b_g_last = tl.load(g + last_token * HV + i_h).to(tl.float32)
-        b_g = tl.load(g + token * HV + i_h, mask=m_t, other=0.0).to(tl.float32)
-        b_rel = tl.where(m_t, exp2(b_g_last - b_g), 0.0)
-        b_decay = exp2(b_g_last)
+        if PRECOMPUTED_GATE:
+            b_rel = tl.load(gate_rel + rel_t * HV + i_h, mask=m_t, other=0.0)
+            b_decay = tl.load(gate_decay + i_t * HV + i_h)
+        else:
+            last_rel = tl.minimum((i_t + 1) * BT, SEGMENT_T) - 1
+            last_token = (BOS + last_rel).to(tl.int64)
+            b_g_last = tl.load(g + last_token * HV + i_h).to(tl.float32)
+            b_g = tl.load(g + token * HV + i_h, mask=m_t, other=0.0).to(tl.float32)
+            b_rel = tl.where(m_t, exp2(b_g_last - b_g), 0.0)
+            b_decay = exp2(b_g_last)
 
         p_k = k + token[:, None] * (H * K) + i_kh * K + k1[None, :]
         b_k = tl.load(p_k, mask=m_t[:, None] & (k1 < K)[None, :], other=0.0)
@@ -669,17 +711,28 @@ def _launch_gdn_transition(
     V: int,
     chunk_size: int,
     forward: bool,
+    gate_rel: torch.Tensor | None = None,
+    gate_decay: torch.Tensor | None = None,
 ) -> None:
     BM = _matrix_tile_size(K)
     NM = triton.cdiv(K, BM)
     kernel = _cp_gdn_fwd_m_kernel if forward else _cp_gdn_bwd_m_kernel
     output_arg = {'hm': summary} if forward else {'dhm': summary}
+    gate_args = {}
+    if forward:
+        precomputed_gate = gate_rel is not None and gate_decay is not None
+        gate_args = {
+            'gate_rel': g if gate_rel is None else gate_rel,
+            'gate_decay': g if gate_decay is None else gate_decay,
+            'PRECOMPUTED_GATE': precomputed_gate,
+        }
     _launch_flat(
         kernel,
         HV * NM,
         k=k,
         w=w,
         g=g,
+        **gate_args,
         **output_arg,
         BOS=bos,
         SEGMENT_T=segment_t,
@@ -1117,6 +1170,25 @@ def chunk_gated_delta_rule_fwd_h_pre_process_npu(
         if is_gdn:
             current_stream = device_torch_lib.current_stream(k.device)
             transition_stream = _summary_stream(k)
+            precomputed_gate = K == 128 and V == 128 and k.dtype in (torch.bfloat16, torch.float16)
+            if precomputed_gate:
+                gate_rel = torch.empty((segment_t, HV), device=k.device, dtype=torch.float32)
+                gate_decay = torch.empty((nt, HV), device=k.device, dtype=torch.float32)
+                _launch_flat(
+                    _cp_gdn_gate_factors_kernel,
+                    HV * nt,
+                    g=g,
+                    gate_rel=gate_rel,
+                    gate_decay=gate_decay,
+                    BOS=bos,
+                    SEGMENT_T=segment_t,
+                    HV=HV,
+                    BT=chunk_size,
+                    NT=nt,
+                )
+            else:
+                gate_rel = g
+                gate_decay = g
             transition_stream.wait_stream(current_stream)
             BV = _value_tile_size(K, V)
             NV = triton.cdiv(V, BV)
@@ -1127,6 +1199,8 @@ def chunk_gated_delta_rule_fwd_h_pre_process_npu(
                 w=w,
                 u=u,
                 g=g,
+                gate_rel=gate_rel,
+                gate_decay=gate_decay,
                 hm=hm,
                 BOS=bos,
                 SEGMENT_T=segment_t,
@@ -1138,6 +1212,7 @@ def chunk_gated_delta_rule_fwd_h_pre_process_npu(
                 BT=chunk_size,
                 BV=BV,
                 NV=NV,
+                PRECOMPUTED_GATE=precomputed_gate,
             )
             with device_torch_lib.stream(transition_stream):
                 _launch_gdn_transition(
@@ -1154,6 +1229,8 @@ def chunk_gated_delta_rule_fwd_h_pre_process_npu(
                     V=V,
                     chunk_size=chunk_size,
                     forward=True,
+                    gate_rel=gate_rel if precomputed_gate else None,
+                    gate_decay=gate_decay if precomputed_gate else None,
                 )
             current_stream.wait_stream(transition_stream)
         else:
