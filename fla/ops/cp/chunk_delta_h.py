@@ -742,12 +742,12 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
     state_v_first: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     initial_state: torch.Tensor | None = None,
-    context: FLACPContext = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    context: FLACPContext | None = None,
+) -> torch.Tensor | None:
     if context is None or context.group is None:
         return initial_state
     assert initial_state is None, "When enable CP, the provided initial_state must be None."
-    if IS_NPU and g is not None and gk is None and bg is None:
+    if IS_NPU:
         from fla.ops.cp.backends.triton_ascend import chunk_gated_delta_rule_fwd_h_pre_process_npu
         return chunk_gated_delta_rule_fwd_h_pre_process_npu(
             k=k,
@@ -846,11 +846,11 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
     initial_state: torch.Tensor | None = None,
     context: FLACPContext | None = None,
     chunk_size: int = 64,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     if context is None or context.group is None:
         return dht, initial_state
     assert dht is None, "When enable CP, the provided dht must be None."
-    if IS_NPU and g is not None and gk is None and bg is None:
+    if IS_NPU:
         from fla.ops.cp.backends.triton_ascend import chunk_gated_delta_rule_bwd_dhu_pre_process_npu
         return chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
             q=q,

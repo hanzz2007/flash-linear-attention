@@ -594,6 +594,109 @@ def _segment_bounds(
     return int(cu_cpu[0]), int(cu_cpu[1])
 
 
+@torch.no_grad()
+def _local_fwd_summary_torch(
+    *,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    gk: torch.Tensor,
+    bg: torch.Tensor | None,
+    v: torch.Tensor | None,
+    bos: int,
+    eos: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Correctness fallback for non-GDN modes; GDN never enters here."""
+    _, _, H, K = k.shape
+    HV, V = u.shape[2], u.shape[-1]
+    hm = k.new_zeros(HV, K, V + K, dtype=torch.float32)
+    is_dplr = bg is not None
+    for i_h in range(HV):
+        i_kh = i_h // (HV // H)
+        state = torch.zeros(K, V, dtype=torch.float32, device=k.device)
+        matrix = torch.eye(K, dtype=torch.float32, device=k.device)
+        for start in range(bos, eos, chunk_size):
+            stop = min(start + chunk_size, eos)
+            kg = k[0, start:stop, i_kh]
+            decay = torch.exp2(gk[0, stop - 1, i_h].float())
+            if is_dplr:
+                w_chunk = w[0, start:stop, i_kh]
+                bg_chunk = bg[0, start:stop, i_kh]
+                value = u[0, start:stop, i_h].float()
+                value += w_chunk.float() @ state.to(w_chunk.dtype).float()
+                state *= decay[:, None]
+                state += kg.float().T @ v[0, start:stop, i_h].to(kg.dtype).float()
+                state += bg_chunk.float().T @ value.to(bg_chunk.dtype).float()
+                tmp = w_chunk.float() @ matrix
+                matrix = decay[:, None] * matrix + bg_chunk.float().T @ tmp
+            else:
+                w_chunk = w[0, start:stop, i_h]
+                value = u[0, start:stop, i_h].float()
+                value -= w_chunk.float() @ state.to(w_chunk.dtype).float()
+                state *= decay[:, None]
+                state += kg.float().T @ value.to(kg.dtype).float()
+                tmp = w_chunk.float() @ matrix
+                matrix = decay[:, None] * matrix - kg.float().T @ tmp
+        hm[i_h, :, :V] = state
+        hm[i_h, :, V:] = matrix
+    return hm
+
+
+@torch.no_grad()
+def _local_bwd_summary_torch(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    do: torch.Tensor,
+    dv: torch.Tensor,
+    gk: torch.Tensor,
+    bg: torch.Tensor | None,
+    scale: float,
+    bos: int,
+    eos: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Correctness fallback for KDA/DPLR backward CP summaries."""
+    _, _, H, K = q.shape
+    HV, V = do.shape[2], do.shape[-1]
+    dhm = q.new_zeros(HV, K, V + K, dtype=torch.float32)
+    is_dplr = bg is not None
+    for i_h in range(HV):
+        i_qh = i_h // (HV // H)
+        state = torch.zeros(K, V, dtype=torch.float32, device=q.device)
+        matrix = torch.eye(K, dtype=torch.float32, device=q.device)
+        starts = range(bos, eos, chunk_size)
+        for start in reversed(tuple(starts)):
+            stop = min(start + chunk_size, eos)
+            q_chunk = q[0, start:stop, i_qh]
+            w_chunk = w[0, start:stop, i_qh if is_dplr else i_h]
+            decay = torch.exp2(gk[0, stop - 1, i_h].float())
+            do_chunk = do[0, start:stop, i_h]
+            if is_dplr:
+                bg_chunk = bg[0, start:stop, i_qh]
+                value = bg_chunk.float() @ state.to(bg_chunk.dtype).float()
+                value += dv[0, start:stop, i_h].float()
+                state *= decay[:, None]
+                state += q_chunk.float().T @ do_chunk.float()
+                state += w_chunk.float().T @ value.to(w_chunk.dtype).float()
+                tmp = bg_chunk.float() @ matrix
+                matrix = decay[:, None] * matrix + w_chunk.float().T @ tmp
+            else:
+                kg = k[0, start:stop, i_qh]
+                value = kg.float() @ state.to(kg.dtype).float()
+                value += dv[0, start:stop, i_h].float()
+                state *= decay[:, None]
+                state += q_chunk.float().T @ do_chunk.float() * scale
+                state -= w_chunk.float().T @ value.to(w_chunk.dtype).float()
+                tmp = kg.float() @ matrix
+                matrix = decay[:, None] * matrix - w_chunk.float().T @ tmp
+        dhm[i_h, :, :V] = state
+        dhm[i_h, :, V:] = matrix
+    return dhm
+
+
 def _merge_rank_chain(
     ag_hm: torch.Tensor,
     output: torch.Tensor,
@@ -646,7 +749,7 @@ def chunk_gated_delta_rule_fwd_h_pre_process_npu(
     k: torch.Tensor,
     w: torch.Tensor,
     u: torch.Tensor,
-    g: torch.Tensor,
+    g: torch.Tensor | None,
     gk: torch.Tensor | None = None,
     bg: torch.Tensor | None = None,
     v: torch.Tensor | None = None,
@@ -655,12 +758,14 @@ def chunk_gated_delta_rule_fwd_h_pre_process_npu(
     cu_seqlens: torch.LongTensor | None = None,
     initial_state: torch.Tensor | None = None,
     context: FLACPContext | None = None,
-) -> torch.Tensor:
-    del v
+) -> torch.Tensor | None:
     if context is None or context.group is None:
         return initial_state
-    if g is None or gk is not None or bg is not None:
-        raise NotImplementedError('The optimized Ascend CP path currently supports GDN only.')
+    is_gdn = g is not None and gk is None and bg is None
+    is_kda = g is None and gk is not None and bg is None
+    is_dplr = g is None and gk is not None and bg is not None and v is not None
+    if not (is_gdn or is_kda or is_dplr):
+        raise ValueError('Unsupported Ascend CP gate combination.')
     assert initial_state is None, 'When enable CP, the provided initial_state must be None.'
     if not dist.is_initialized():
         raise RuntimeError('CP requires an initialized process group')
@@ -680,47 +785,60 @@ def chunk_gated_delta_rule_fwd_h_pre_process_npu(
         bos, eos = _segment_bounds(cu_seqlens, context, forward=True, fallback_t=T)
         segment_t = eos - bos
         nt = triton.cdiv(segment_t, chunk_size)
-        BV = _value_tile_size(K, V)
-        NV = triton.cdiv(V, BV)
-        _launch_flat(
-            _cp_gdn_fwd_h_kernel,
-            HV * NV,
-            k=k,
-            w=w,
-            u=u,
-            g=g,
-            hm=hm,
-            BOS=bos,
-            SEGMENT_T=segment_t,
-            NT=nt,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            BT=chunk_size,
-            BV=BV,
-            NV=NV,
-        )
-        BM = _matrix_tile_size(K)
-        NM = triton.cdiv(K, BM)
-        _launch_flat(
-            _cp_gdn_fwd_m_kernel,
-            HV * NM,
-            k=k,
-            w=w,
-            g=g,
-            hm=hm,
-            BOS=bos,
-            SEGMENT_T=segment_t,
-            NT=nt,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            BT=chunk_size,
-            BM=BM,
-            NM=NM,
-        )
+        if is_gdn:
+            BV = _value_tile_size(K, V)
+            NV = triton.cdiv(V, BV)
+            _launch_flat(
+                _cp_gdn_fwd_h_kernel,
+                HV * NV,
+                k=k,
+                w=w,
+                u=u,
+                g=g,
+                hm=hm,
+                BOS=bos,
+                SEGMENT_T=segment_t,
+                NT=nt,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                BT=chunk_size,
+                BV=BV,
+                NV=NV,
+            )
+            BM = _matrix_tile_size(K)
+            NM = triton.cdiv(K, BM)
+            _launch_flat(
+                _cp_gdn_fwd_m_kernel,
+                HV * NM,
+                k=k,
+                w=w,
+                g=g,
+                hm=hm,
+                BOS=bos,
+                SEGMENT_T=segment_t,
+                NT=nt,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                BT=chunk_size,
+                BM=BM,
+                NM=NM,
+            )
+        else:
+            hm = _local_fwd_summary_torch(
+                k=k,
+                w=w,
+                u=u,
+                gk=gk,
+                bg=bg,
+                v=v,
+                bos=bos,
+                eos=eos,
+                chunk_size=chunk_size,
+            )
 
     ag_hm, _ = all_gather_into_tensor(hm, group=context.group)
     if not context.is_first_rank:
@@ -743,7 +861,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
     w: torch.Tensor,
     do: torch.Tensor,
     dv: torch.Tensor,
-    g: torch.Tensor,
+    g: torch.Tensor | None,
     gk: torch.Tensor | None = None,
     bg: torch.Tensor | None = None,
     scale: float | None = None,
@@ -753,12 +871,15 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
     initial_state: torch.Tensor | None = None,
     context: FLACPContext | None = None,
     chunk_size: int = 64,
-) -> tuple[torch.Tensor, None]:
+) -> tuple[torch.Tensor | None, None]:
     del initial_state
     if context is None or context.group is None:
         return dht, None
-    if g is None or gk is not None or bg is not None:
-        raise NotImplementedError('The optimized Ascend CP path currently supports GDN only.')
+    is_gdn = g is not None and gk is None and bg is None
+    is_kda = g is None and gk is not None and bg is None
+    is_dplr = g is None and gk is not None and bg is not None
+    if not (is_gdn or is_kda or is_dplr):
+        raise ValueError('Unsupported Ascend CP gate combination.')
     assert dht is None, 'When enable CP, the provided dht must be None.'
     if not dist.is_initialized():
         raise RuntimeError('CP requires an initialized process group')
@@ -778,50 +899,65 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
         bos, eos = _segment_bounds(cu_seqlens, context, forward=False, fallback_t=T)
         segment_t = eos - bos
         nt = triton.cdiv(segment_t, chunk_size)
-        BV = _value_tile_size(K, V)
-        NV = triton.cdiv(V, BV)
-        _launch_flat(
-            _cp_gdn_bwd_dh_kernel,
-            HV * NV,
-            q=q,
-            k=k,
-            w=w,
-            do=do,
-            dv=dv,
-            g=g,
-            dhm=dhm,
-            BOS=bos,
-            SEGMENT_T=segment_t,
-            NT=nt,
-            scale=scale,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            BT=chunk_size,
-            BV=BV,
-            NV=NV,
-        )
-        BM = _matrix_tile_size(K)
-        NM = triton.cdiv(K, BM)
-        _launch_flat(
-            _cp_gdn_bwd_m_kernel,
-            HV * NM,
-            k=k,
-            w=w,
-            g=g,
-            dhm=dhm,
-            BOS=bos,
-            SEGMENT_T=segment_t,
-            NT=nt,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            BT=chunk_size,
-            BM=BM,
-            NM=NM,
-        )
+        if is_gdn:
+            BV = _value_tile_size(K, V)
+            NV = triton.cdiv(V, BV)
+            _launch_flat(
+                _cp_gdn_bwd_dh_kernel,
+                HV * NV,
+                q=q,
+                k=k,
+                w=w,
+                do=do,
+                dv=dv,
+                g=g,
+                dhm=dhm,
+                BOS=bos,
+                SEGMENT_T=segment_t,
+                NT=nt,
+                scale=scale,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                BT=chunk_size,
+                BV=BV,
+                NV=NV,
+            )
+            BM = _matrix_tile_size(K)
+            NM = triton.cdiv(K, BM)
+            _launch_flat(
+                _cp_gdn_bwd_m_kernel,
+                HV * NM,
+                k=k,
+                w=w,
+                g=g,
+                dhm=dhm,
+                BOS=bos,
+                SEGMENT_T=segment_t,
+                NT=nt,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                BT=chunk_size,
+                BM=BM,
+                NM=NM,
+            )
+        else:
+            dhm = _local_bwd_summary_torch(
+                q=q,
+                k=k,
+                w=w,
+                do=do,
+                dv=dv,
+                gk=gk,
+                bg=bg,
+                scale=scale,
+                bos=bos,
+                eos=eos,
+                chunk_size=chunk_size,
+            )
 
     ag_dhm, _ = all_gather_into_tensor(dhm, group=context.group)
     if not context.is_last_rank:
