@@ -834,6 +834,38 @@ def _cp_merge_rank_chain_kernel(
             tl.store(p_out, b_state2, mask=(k2 < K)[:, None] & m_v[None, :])
 
 
+@triton.jit
+def _cp_transpose_state_kernel(
+    state_in,
+    state_out,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    NK: tl.constexpr,
+    NV: tl.constexpr,
+    TASK_OFFSET: tl.constexpr,
+):
+    """Transpose a contiguous ``[HV, K, V]`` state using explicit strides."""
+    task = tl.program_id(0) + TASK_OFFSET
+    tiles_per_head = NK * NV
+    i_h = task // tiles_per_head
+    tile = task - i_h * tiles_per_head
+    i_k = tile // NV
+    i_v = tile - i_k * NV
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask = (o_v < V)[:, None] & (o_k < K)[None, :]
+    input_base = (i_h * K * V).to(tl.int64)
+    p_in = state_in + input_base + o_k[None, :] * V + o_v[:, None]
+    b_state = tl.load(p_in, mask=mask, other=0.0)
+    output_base = (i_h * V * K).to(tl.int64)
+    p_out = state_out + output_base + o_v[:, None] * K + o_k[None, :]
+    tl.store(p_out, b_state, mask=mask)
+
+
 def _segment_bounds(
     cu_seqlens: torch.LongTensor | None,
     context: FLACPContext,
@@ -966,16 +998,19 @@ def _merge_rank_chain(
 ) -> None:
     if not ranks:
         return
-    if K <= 128 and not state_v_first:
+    if K <= 128:
         BV = 32
         NV = triton.cdiv(V, BV)
         source_step = 1 if len(ranks) == 1 else ranks[1] - ranks[0]
         assert all(right - left == source_step for left, right in zip(ranks[:-1], ranks[1:], strict=True))
+        merge_output = output
+        if state_v_first:
+            merge_output = torch.empty((HV, K, V), device=ag_hm.device, dtype=torch.float32)
         _launch_flat(
             _cp_merge_rank_chain_kernel,
             HV * NV,
             ag_hm=ag_hm,
-            state_out=output,
+            state_out=merge_output,
             SOURCE_START=ranks[0],
             SOURCE_STEP=source_step,
             HV=HV,
@@ -984,8 +1019,24 @@ def _merge_rank_chain(
             BV=BV,
             NV=NV,
             NUM_RANKS=len(ranks),
-            OUTPUT_V_FIRST=state_v_first,
+            OUTPUT_V_FIRST=False,
         )
+        if state_v_first:
+            BK = 32
+            NK = triton.cdiv(K, BK)
+            _launch_flat(
+                _cp_transpose_state_kernel,
+                HV * NK * NV,
+                state_in=merge_output,
+                state_out=output,
+                HV=HV,
+                K=K,
+                V=V,
+                BK=BK,
+                BV=BV,
+                NK=NK,
+                NV=NV,
+            )
         return
     BR = 16
     BV = 16
