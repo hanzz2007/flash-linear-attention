@@ -39,6 +39,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument('--chunk-size', type=int, choices=(16, 32, 64), default=64)
     parser.add_argument('--dtype', choices=('bfloat16', 'float16'), default='bfloat16')
     parser.add_argument('--direction', choices=('fwd', 'bwd'), default='fwd')
+    parser.add_argument(
+        '--component',
+        choices=('full', 'h', 'm'),
+        default='full',
+        help='Use h/m only for single-device Triton-Ascend diagnostics.',
+    )
     parser.add_argument('--state-v-first', action='store_true')
     parser.add_argument('--warmup', type=int, default=3)
     parser.add_argument('--samples', type=int, default=10)
@@ -86,7 +92,95 @@ def _make_inputs(args: argparse.Namespace, local_seq_len: int, local_rank: int):
 
 
 @torch.no_grad()
-def _run_once(args: argparse.Namespace, inputs, context) -> torch.Tensor:
+def _run_local_kernel(args: argparse.Namespace, inputs, scratch: torch.Tensor) -> torch.Tensor:
+    if not IS_NPU:
+        raise RuntimeError('The component diagnostic is Triton-Ascend only')
+    from fla.ops.cp.backends.triton_ascend.chunk_delta_h import (
+        _backward_value_tile_size,
+        _cp_gdn_bwd_dh_kernel,
+        _cp_gdn_fwd_h_kernel,
+        _launch_flat,
+        _launch_gdn_transition,
+        _value_tile_size,
+    )
+
+    q, k, w, u, do, dv, g = inputs
+    _, local_seq_len, H, K = k.shape
+    HV, V = u.shape[2], u.shape[-1]
+    nt = (local_seq_len + args.chunk_size - 1) // args.chunk_size
+    if args.component == 'h':
+        bv = (
+            _value_tile_size(K, V)
+            if args.direction == 'fwd'
+            else _backward_value_tile_size(K, V)
+        )
+        nv = (V + bv - 1) // bv
+        if args.direction == 'fwd':
+            _launch_flat(
+                _cp_gdn_fwd_h_kernel,
+                HV * nv,
+                k=k,
+                w=w,
+                u=u,
+                g=g,
+                hm=scratch,
+                BOS=0,
+                SEGMENT_T=local_seq_len,
+                NT=nt,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                BT=args.chunk_size,
+                BV=bv,
+                NV=nv,
+            )
+        else:
+            _launch_flat(
+                _cp_gdn_bwd_dh_kernel,
+                HV * nv,
+                q=q,
+                k=k,
+                w=w,
+                do=do,
+                dv=dv,
+                g=g,
+                dhm=scratch,
+                BOS=0,
+                SEGMENT_T=local_seq_len,
+                NT=nt,
+                scale=K**-0.5,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                BT=args.chunk_size,
+                BV=bv,
+                NV=nv,
+            )
+    else:
+        _launch_gdn_transition(
+            summary=scratch,
+            k=k,
+            w=w,
+            g=g,
+            bos=0,
+            segment_t=local_seq_len,
+            nt=nt,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            chunk_size=args.chunk_size,
+            forward=args.direction == 'fwd',
+        )
+    return scratch
+
+
+@torch.no_grad()
+def _run_once(args: argparse.Namespace, inputs, context, scratch: torch.Tensor) -> torch.Tensor:
+    if args.component != 'full':
+        return _run_local_kernel(args, inputs, scratch)
     q, k, w, u, do, dv, g = inputs
     if args.direction == 'fwd':
         return chunk_gated_delta_rule_fwd_h_pre_process(
@@ -149,8 +243,15 @@ def main() -> None:
     cu_cpu = torch.tensor([0, args.total_seq_len], dtype=torch.long)
     context = build_cp_context(cu_cpu.to(device_obj), dist.group.WORLD, cu_seqlens_cpu=cu_cpu)
     inputs = _make_inputs(args, local_seq_len, local_rank)
+    scratch = torch.zeros(
+        args.v_heads,
+        args.key_dim,
+        args.value_dim + args.key_dim,
+        dtype=torch.float32,
+        device=device_obj,
+    )
 
-    result = _run_once(args, inputs, context)
+    result = _run_once(args, inputs, context, scratch)
     device_torch_lib.synchronize()
     finite = torch.tensor(float(torch.isfinite(result).all().item()), device=device_obj)
     dist.all_reduce(finite, op=dist.ReduceOp.MIN)
@@ -158,7 +259,7 @@ def main() -> None:
         raise AssertionError('GDN CP preprocessing produced a non-finite result')
     dist.barrier()
     for _ in range(args.warmup):
-        _run_once(args, inputs, context)
+        _run_once(args, inputs, context, scratch)
     device_torch_lib.synchronize()
     dist.barrier()
 
@@ -168,7 +269,7 @@ def main() -> None:
         dist.barrier()
         device_torch_lib.synchronize()
         started = time.perf_counter_ns()
-        _run_once(args, inputs, context)
+        _run_once(args, inputs, context, scratch)
         device_torch_lib.synchronize()
         local_ms = (time.perf_counter_ns() - started) / 1e6
         critical_ms = torch.tensor(local_ms, dtype=torch.float32, device=device_obj)
@@ -187,6 +288,7 @@ def main() -> None:
             'device': device_torch_lib.get_device_name(local_rank),
             'world_size': world_size,
             'direction': args.direction,
+            'component': args.component,
             'dtype': args.dtype,
             'total_seq_len': args.total_seq_len,
             'local_seq_len': local_seq_len,

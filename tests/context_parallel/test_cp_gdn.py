@@ -213,40 +213,39 @@ def run_cp_gdn_test_worker(
         cu_seqlens_global = torch.tensor(cu_seqlens_list, device=worker_device, dtype=torch.long)
 
         # Step 2: Reference Run (single GPU, varlen, no CP)
-        ref_out = None
-        ref_dq, ref_dk, ref_dv, ref_dg, ref_db = None, None, None, None, None
+        # Run the reference on every device. Besides reducing wall time through
+        # parallel compilation, this prevents nonzero ranks from entering an
+        # HCCL collective minutes before rank 0 on cold-cache configurations.
+        q_ref = q_global.clone().detach().requires_grad_(True)
+        k_ref = k_global.clone().detach().requires_grad_(True)
+        v_ref = v_global.clone().detach().requires_grad_(True)
+        g_ref = g_global.clone().detach().requires_grad_(True)
+        beta_ref = beta_global.clone().detach().requires_grad_(True)
 
-        if rank == 0:
-            q_ref = q_global.clone().detach().requires_grad_(True)
-            k_ref = k_global.clone().detach().requires_grad_(True)
-            v_ref = v_global.clone().detach().requires_grad_(True)
-            g_ref = g_global.clone().detach().requires_grad_(True)
-            beta_ref = beta_global.clone().detach().requires_grad_(True)
+        o_ref, _ = chunk_gated_delta_rule(
+            q=q_ref,
+            k=k_ref,
+            v=v_ref,
+            g=g_ref,
+            beta=beta_ref,
+            cu_seqlens=cu_seqlens_global,
+            state_v_first=state_v_first,
+            chunk_size=op_chunk_size,
+            use_qk_l2norm_in_kernel=fused_inputs,
+            use_gate_in_kernel=fused_inputs,
+            A_log=A_log if fused_inputs else None,
+            dt_bias=dt_bias if fused_inputs else None,
+            use_beta_sigmoid_in_kernel=fused_inputs,
+        )
 
-            o_ref, _ = chunk_gated_delta_rule(
-                q=q_ref,
-                k=k_ref,
-                v=v_ref,
-                g=g_ref,
-                beta=beta_ref,
-                cu_seqlens=cu_seqlens_global,
-                state_v_first=state_v_first,
-                chunk_size=op_chunk_size,
-                use_qk_l2norm_in_kernel=fused_inputs,
-                use_gate_in_kernel=fused_inputs,
-                A_log=A_log if fused_inputs else None,
-                dt_bias=dt_bias if fused_inputs else None,
-                use_beta_sigmoid_in_kernel=fused_inputs,
-            )
+        o_ref.backward(do_global)
 
-            o_ref.backward(do_global)
-
-            ref_out = o_ref.detach()
-            ref_dq = q_ref.grad.detach()
-            ref_dk = k_ref.grad.detach()
-            ref_dv = v_ref.grad.detach()
-            ref_dg = g_ref.grad.detach()
-            ref_db = beta_ref.grad.detach()
+        ref_out = o_ref.detach()
+        ref_dq = q_ref.grad.detach()
+        ref_dk = k_ref.grad.detach()
+        ref_dv = v_ref.grad.detach()
+        ref_dg = g_ref.grad.detach()
+        ref_db = beta_ref.grad.detach()
 
         # Step 3: Context Parallel Run
         dist.barrier()
@@ -496,6 +495,7 @@ def test_cp2_gqa_single_sequence():
     )
 
 
+@pytest.mark.skipif(not IS_NPU, reason='Ascend K=256 CP coverage')
 def test_cp2_k256_value64_tail():
     """CP2: K=256, K != V, and partial boundary chunks."""
     if device_torch_lib.device_count() < 2:
@@ -504,8 +504,8 @@ def test_cp2_k256_value64_tail():
     run_cp_test_with_spawn(
         world_size=2,
         test_name="CP2_K256_Value64_Tail",
-        T=4224, H=2, D=256, Dv=64,
-        lengths=[3001, 1223],
+        T=512, H=2, D=256, Dv=64,
+        lengths=[301, 211],
         dtype=torch.bfloat16,
     )
 

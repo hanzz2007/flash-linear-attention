@@ -17,12 +17,11 @@ import torch.multiprocessing as mp
 
 from fla.ops.cp import build_cp_context
 from fla.ops.cp.backends.triton_ascend.chunk_delta_h import (
+    _backward_value_tile_size,
     _cp_gdn_bwd_dh_kernel,
-    _cp_gdn_bwd_m_kernel,
     _cp_gdn_fwd_h_kernel,
-    _cp_gdn_fwd_m_kernel,
     _launch_flat,
-    _matrix_tile_size,
+    _launch_gdn_transition,
     _value_tile_size,
 )
 from fla.ops.cp.chunk_delta_h import (
@@ -255,22 +254,39 @@ def test_gdn_cp4_forward_preprocess(state_v_first: bool) -> None:
 
 
 @pytest.mark.skipif(not IS_NPU, reason='Triton-Ascend primitive test')
-def test_gdn_local_summaries_match_independent_reference() -> None:
+@pytest.mark.parametrize(
+    ('K', 'V', 'chunk_size', 'segment_t', 'input_scale', 'check_states'),
+    [
+        (96, 80, 32, 70, 0.05, True),
+        (256, 64, 16, 38, 0.05, True),
+        (32, 48, 32, 378, 0.05, True),
+        (128, 64, 32, 70, 0.2, False),
+    ],
+    ids=['k96-v80-tail', 'k256-v64-tail', 'long-serial-scan', 'transition-dot-range'],
+)
+def test_gdn_local_summaries_match_independent_reference(
+    K: int,
+    V: int,
+    chunk_size: int,
+    segment_t: int,
+    input_scale: float,
+    check_states: bool,
+) -> None:
     """Cover non-zero BOS, tail chunks, GVA, K != V, and poisoned outputs."""
     dtype = torch.bfloat16
-    chunk_size = 32
-    total_t, bos, segment_t = 83, 7, 70
-    H, HV, K, V = 1, 2, 96, 80
+    bos = 7
+    total_t = bos + segment_t + 6
+    H, HV = 1, 2
     scale = K**-0.5
     device_obj = torch.device(device)
 
     generator = torch.Generator().manual_seed(20260715)
-    q_cpu = torch.randn(1, total_t, H, K, generator=generator) * 0.05
-    k_cpu = torch.randn(1, total_t, H, K, generator=generator) * 0.05
-    w_cpu = torch.randn(1, total_t, HV, K, generator=generator) * 0.05
-    u_cpu = torch.randn(1, total_t, HV, V, generator=generator) * 0.05
-    do_cpu = torch.randn(1, total_t, HV, V, generator=generator) * 0.05
-    dv_cpu = torch.randn(1, total_t, HV, V, generator=generator) * 0.05
+    q_cpu = torch.randn(1, total_t, H, K, generator=generator) * input_scale
+    k_cpu = torch.randn(1, total_t, H, K, generator=generator) * input_scale
+    w_cpu = torch.randn(1, total_t, HV, K, generator=generator) * input_scale
+    u_cpu = torch.randn(1, total_t, HV, V, generator=generator) * input_scale
+    do_cpu = torch.randn(1, total_t, HV, V, generator=generator) * input_scale
+    dv_cpu = torch.randn(1, total_t, HV, V, generator=generator) * input_scale
     g_cpu = torch.zeros(1, total_t, HV)
     for start in range(0, segment_t, chunk_size):
         stop = min(start + chunk_size, segment_t)
@@ -308,25 +324,20 @@ def test_gdn_local_summaries_match_independent_reference() -> None:
         BV=bv,
         NV=nv,
     )
-    bm = _matrix_tile_size(K)
-    nm = (K + bm - 1) // bm
-    _launch_flat(
-        _cp_gdn_fwd_m_kernel,
-        HV * nm,
+    _launch_gdn_transition(
+        summary=hm,
         k=k,
         w=w,
         g=g,
-        hm=hm,
-        BOS=bos,
-        SEGMENT_T=segment_t,
-        NT=nt,
+        bos=bos,
+        segment_t=segment_t,
+        nt=nt,
         H=H,
         HV=HV,
         K=K,
         V=V,
-        BT=chunk_size,
-        BM=bm,
-        NM=nm,
+        chunk_size=chunk_size,
+        forward=True,
     )
 
     ref_h = _reference_local_forward_state(
@@ -349,9 +360,11 @@ def test_gdn_local_summaries_match_independent_reference() -> None:
     )
 
     dhm = torch.full_like(hm, float('nan'))
+    bwd_bv = _backward_value_tile_size(K, V)
+    bwd_nv = (V + bwd_bv - 1) // bwd_bv
     _launch_flat(
         _cp_gdn_bwd_dh_kernel,
-        HV * nv,
+        HV * bwd_nv,
         q=q,
         k=k,
         w=w,
@@ -368,26 +381,23 @@ def test_gdn_local_summaries_match_independent_reference() -> None:
         K=K,
         V=V,
         BT=chunk_size,
-        BV=bv,
-        NV=nv,
+        BV=bwd_bv,
+        NV=bwd_nv,
     )
-    _launch_flat(
-        _cp_gdn_bwd_m_kernel,
-        HV * nm,
+    _launch_gdn_transition(
+        summary=dhm,
         k=k,
         w=w,
         g=g,
-        dhm=dhm,
-        BOS=bos,
-        SEGMENT_T=segment_t,
-        NT=nt,
+        bos=bos,
+        segment_t=segment_t,
+        nt=nt,
         H=H,
         HV=HV,
         K=K,
         V=V,
-        BT=chunk_size,
-        BM=bm,
-        NM=nm,
+        chunk_size=chunk_size,
+        forward=False,
     )
     ref_dh = _reference_backward_state(
         q,
@@ -413,12 +423,16 @@ def test_gdn_local_summaries_match_independent_reference() -> None:
 
     assert torch.isfinite(hm).all().item()
     assert torch.isfinite(dhm).all().item()
-    for name, reference, actual in (
-        ('H', ref_h, hm[:, :, :V]),
+    checked = (
         ('M', ref_m, hm[:, :, V:]),
-        ('dH', ref_dh, dhm[:, :, :V]),
         ('dM', ref_dm, dhm[:, :, V:]),
-    ):
+    )
+    if check_states:
+        checked += (
+            ('H', ref_h, hm[:, :, :V]),
+            ('dH', ref_dh, dhm[:, :, :V]),
+        )
+    for name, reference, actual in checked:
         max_abs, ratio = _strict_ratio(reference, actual)
         assert max_abs <= 1e-6 or ratio < 1e-4, (
             f'{name}: max_abs={max_abs:.6g}, ratio={ratio:.6g}'

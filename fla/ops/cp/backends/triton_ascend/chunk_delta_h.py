@@ -18,6 +18,7 @@ import triton.language as tl
 
 from fla.ops.cp.comm import all_gather_into_tensor
 from fla.ops.utils.op import exp2
+from fla.utils import device_torch_lib
 from fla.utils.ascend_ub_manager import ASCEND_MAX_GRID_DIM, iter_axis_launch_chunks
 
 if TYPE_CHECKING:
@@ -25,18 +26,36 @@ if TYPE_CHECKING:
 
 
 _NUM_WARPS = 4
+_SUMMARY_STREAMS: dict[int, object] = {}
+
+
+def _summary_stream(tensor: torch.Tensor):
+    device_index = tensor.device.index
+    if device_index is None:
+        device_index = device_torch_lib.current_device()
+    stream = _SUMMARY_STREAMS.get(device_index)
+    if stream is None:
+        stream = device_torch_lib.Stream(device=device_index)
+        _SUMMARY_STREAMS[device_index] = stream
+    return stream
 
 
 def _value_tile_size(K: int, V: int) -> int:
     if K <= 64:
         return min(64, triton.next_power_of_2(V))
     if K <= 128:
-        return min(32, triton.next_power_of_2(V))
+        return min(128, triton.next_power_of_2(V))
+    return min(16, triton.next_power_of_2(V))
+
+
+def _backward_value_tile_size(K: int, V: int) -> int:
+    if K <= 128:
+        return min(64, triton.next_power_of_2(V))
     return min(16, triton.next_power_of_2(V))
 
 
 def _matrix_tile_size(K: int) -> int:
-    return 32 if K <= 128 else 16
+    return 128 if K <= 128 else 16
 
 
 def _launch_flat(kernel, total_tasks: int, **kwargs) -> None:
@@ -51,6 +70,14 @@ def _launch_flat(kernel, total_tasks: int, **kwargs) -> None:
             multibuffer=False,
             **kwargs,
         )
+
+
+@triton.jit
+def _dot_fp32_low_rhs(lhs, rhs):
+    """Preserve the FP32 left operand with a low-precision residual pair."""
+    lhs_hi = lhs.to(rhs.dtype)
+    lhs_lo = (lhs - lhs_hi.to(tl.float32)).to(rhs.dtype)
+    return tl.dot(lhs_hi, rhs, allow_tf32=False) + tl.dot(lhs_lo, rhs, allow_tf32=False)
 
 
 @triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT'])
@@ -372,7 +399,7 @@ def _cp_gdn_bwd_dh_kernel(
         p_w = w + token[None, :] * (HV * K) + i_h * K + k1[:, None]
         b_w = tl.load(p_w, mask=(k1 < K)[:, None] & m_t[None, :], other=0.0)
         b_dh1 *= b_decay
-        b_dh1 += tl.dot(b_qg, b_do.to(tl.float32), allow_tf32=False) * scale
+        b_dh1 += _dot_fp32_low_rhs(b_qg, b_do) * scale
         b_dh1 -= tl.dot(b_w, b_dv.to(b_w.dtype), allow_tf32=False)
         if K > 64:
             p_q = q + token[None, :] * (H * K) + i_qh * K + k2[:, None]
@@ -381,7 +408,7 @@ def _cp_gdn_bwd_dh_kernel(
             p_w = w + token[None, :] * (HV * K) + i_h * K + k2[:, None]
             b_w = tl.load(p_w, mask=(k2 < K)[:, None] & m_t[None, :], other=0.0)
             b_dh2 *= b_decay
-            b_dh2 += tl.dot(b_qg, b_do.to(tl.float32), allow_tf32=False) * scale
+            b_dh2 += _dot_fp32_low_rhs(b_qg, b_do) * scale
             b_dh2 -= tl.dot(b_w, b_dv.to(b_w.dtype), allow_tf32=False)
         if K > 128:
             p_q = q + token[None, :] * (H * K) + i_qh * K + k3[:, None]
@@ -390,7 +417,7 @@ def _cp_gdn_bwd_dh_kernel(
             p_w = w + token[None, :] * (HV * K) + i_h * K + k3[:, None]
             b_w = tl.load(p_w, mask=(k3 < K)[:, None] & m_t[None, :], other=0.0)
             b_dh3 *= b_decay
-            b_dh3 += tl.dot(b_qg, b_do.to(tl.float32), allow_tf32=False) * scale
+            b_dh3 += _dot_fp32_low_rhs(b_qg, b_do) * scale
             b_dh3 -= tl.dot(b_w, b_dv.to(b_w.dtype), allow_tf32=False)
         if K > 192:
             p_q = q + token[None, :] * (H * K) + i_qh * K + k4[:, None]
@@ -399,7 +426,7 @@ def _cp_gdn_bwd_dh_kernel(
             p_w = w + token[None, :] * (HV * K) + i_h * K + k4[:, None]
             b_w = tl.load(p_w, mask=(k4 < K)[:, None] & m_t[None, :], other=0.0)
             b_dh4 *= b_decay
-            b_dh4 += tl.dot(b_qg, b_do.to(tl.float32), allow_tf32=False) * scale
+            b_dh4 += _dot_fp32_low_rhs(b_qg, b_do) * scale
             b_dh4 -= tl.dot(b_w, b_dv.to(b_w.dtype), allow_tf32=False)
 
     dhm_base = (i_h * K * (V + K)).to(tl.int64)
@@ -520,6 +547,46 @@ def _cp_gdn_bwd_m_kernel(
     if K > 192:
         p_m = dhm + dhm_base + k4[:, None] * (V + K) + o_m[None, :]
         tl.store(p_m, b_m4, mask=(k4 < K)[:, None] & m_m[None, :])
+
+
+def _launch_gdn_transition(
+    *,
+    summary: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    g: torch.Tensor,
+    bos: int,
+    segment_t: int,
+    nt: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    chunk_size: int,
+    forward: bool,
+) -> None:
+    BM = _matrix_tile_size(K)
+    NM = triton.cdiv(K, BM)
+    kernel = _cp_gdn_fwd_m_kernel if forward else _cp_gdn_bwd_m_kernel
+    output_arg = {'hm': summary} if forward else {'dhm': summary}
+    _launch_flat(
+        kernel,
+        HV * NM,
+        k=k,
+        w=w,
+        g=g,
+        **output_arg,
+        BOS=bos,
+        SEGMENT_T=segment_t,
+        NT=nt,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BT=chunk_size,
+        BM=BM,
+        NM=NM,
+    )
 
 
 @triton.jit(do_not_specialize=['SOURCE_RANK'])
@@ -786,6 +853,9 @@ def chunk_gated_delta_rule_fwd_h_pre_process_npu(
         segment_t = eos - bos
         nt = triton.cdiv(segment_t, chunk_size)
         if is_gdn:
+            current_stream = device_torch_lib.current_stream(k.device)
+            transition_stream = _summary_stream(k)
+            transition_stream.wait_stream(current_stream)
             BV = _value_tile_size(K, V)
             NV = triton.cdiv(V, BV)
             _launch_flat(
@@ -807,26 +877,23 @@ def chunk_gated_delta_rule_fwd_h_pre_process_npu(
                 BV=BV,
                 NV=NV,
             )
-            BM = _matrix_tile_size(K)
-            NM = triton.cdiv(K, BM)
-            _launch_flat(
-                _cp_gdn_fwd_m_kernel,
-                HV * NM,
-                k=k,
-                w=w,
-                g=g,
-                hm=hm,
-                BOS=bos,
-                SEGMENT_T=segment_t,
-                NT=nt,
-                H=H,
-                HV=HV,
-                K=K,
-                V=V,
-                BT=chunk_size,
-                BM=BM,
-                NM=NM,
-            )
+            with device_torch_lib.stream(transition_stream):
+                _launch_gdn_transition(
+                    summary=hm,
+                    k=k,
+                    w=w,
+                    g=g,
+                    bos=bos,
+                    segment_t=segment_t,
+                    nt=nt,
+                    H=H,
+                    HV=HV,
+                    K=K,
+                    V=V,
+                    chunk_size=chunk_size,
+                    forward=True,
+                )
+            current_stream.wait_stream(transition_stream)
         else:
             hm = _local_fwd_summary_torch(
                 k=k,
@@ -900,7 +967,10 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
         segment_t = eos - bos
         nt = triton.cdiv(segment_t, chunk_size)
         if is_gdn:
-            BV = _value_tile_size(K, V)
+            current_stream = device_torch_lib.current_stream(q.device)
+            transition_stream = _summary_stream(q)
+            transition_stream.wait_stream(current_stream)
+            BV = _backward_value_tile_size(K, V)
             NV = triton.cdiv(V, BV)
             _launch_flat(
                 _cp_gdn_bwd_dh_kernel,
@@ -924,26 +994,23 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
                 BV=BV,
                 NV=NV,
             )
-            BM = _matrix_tile_size(K)
-            NM = triton.cdiv(K, BM)
-            _launch_flat(
-                _cp_gdn_bwd_m_kernel,
-                HV * NM,
-                k=k,
-                w=w,
-                g=g,
-                dhm=dhm,
-                BOS=bos,
-                SEGMENT_T=segment_t,
-                NT=nt,
-                H=H,
-                HV=HV,
-                K=K,
-                V=V,
-                BT=chunk_size,
-                BM=BM,
-                NM=NM,
-            )
+            with device_torch_lib.stream(transition_stream):
+                _launch_gdn_transition(
+                    summary=dhm,
+                    k=k,
+                    w=w,
+                    g=g,
+                    bos=bos,
+                    segment_t=segment_t,
+                    nt=nt,
+                    H=H,
+                    HV=HV,
+                    K=K,
+                    V=V,
+                    chunk_size=chunk_size,
+                    forward=False,
+                )
+            current_stream.wait_stream(transition_stream)
         else:
             dhm = _local_bwd_summary_torch(
                 q=q,
