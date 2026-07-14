@@ -862,7 +862,7 @@ def _merge_rank_chain(
     if not ranks:
         return
     if K <= 128 and not state_v_first:
-        BV = 128
+        BV = 32
         NV = triton.cdiv(V, BV)
         source_step = 1 if len(ranks) == 1 else ranks[1] - ranks[0]
         assert all(right - left == source_step for left, right in zip(ranks[:-1], ranks[1:], strict=True))
