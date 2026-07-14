@@ -498,9 +498,9 @@ def test_gdn_local_summaries_match_independent_reference(
 
     precomputed_dhm = None
     if K == 128 and V == 128:
-        bwd_gate_rel = torch.full((segment_t, HV), float('nan'), dtype=torch.float32, device=device_obj)
-        gate_abs = torch.full((segment_t, HV), float('nan'), dtype=torch.float32, device=device_obj)
-        bwd_gate_decay = torch.full((nt, HV), float('nan'), dtype=torch.float32, device=device_obj)
+        bwd_gate_rel = torch.full((HV, segment_t), float('nan'), dtype=torch.float32, device=device_obj)
+        gate_abs = torch.full((HV, segment_t), float('nan'), dtype=torch.float32, device=device_obj)
+        bwd_gate_decay = torch.full((HV, nt), float('nan'), dtype=torch.float32, device=device_obj)
         _launch_flat(
             _cp_gdn_bwd_gate_factors_kernel,
             HV * nt,

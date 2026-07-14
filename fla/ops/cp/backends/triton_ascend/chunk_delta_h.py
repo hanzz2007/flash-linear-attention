@@ -132,9 +132,10 @@ def _cp_gdn_bwd_gate_factors_kernel(
     last_token = (BOS + last_rel).to(tl.int64)
     b_g_last = tl.load(g + last_token * HV + i_h).to(tl.float32)
     b_g = tl.load(g + token * HV + i_h, mask=m_t, other=0.0).to(tl.float32)
-    tl.store(gate_rel + rel_t * HV + i_h, exp2(b_g_last - b_g), mask=m_t)
-    tl.store(gate_abs + rel_t * HV + i_h, exp2(b_g), mask=m_t)
-    tl.store(gate_decay + i_t * HV + i_h, exp2(b_g_last))
+    gate_base = i_h.to(tl.int64) * SEGMENT_T
+    tl.store(gate_rel + gate_base + rel_t, exp2(b_g_last - b_g), mask=m_t)
+    tl.store(gate_abs + gate_base + rel_t, exp2(b_g), mask=m_t)
+    tl.store(gate_decay + i_h * NT + i_t, exp2(b_g_last))
 
 
 @triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT'])
@@ -670,9 +671,10 @@ def _cp_gdn_bwd_fused_128_kernel(
         m_t = rel_t < SEGMENT_T
         token = (BOS + rel_t).to(tl.int64)
         if PRECOMPUTED_GATE:
-            b_rel = tl.load(gate_rel + rel_t * HV + i_h, mask=m_t, other=0.0)
-            b_gate = tl.load(gate_abs + rel_t * HV + i_h, mask=m_t, other=0.0)
-            b_decay = tl.load(gate_decay + i_t * HV + i_h)
+            gate_base = i_h.to(tl.int64) * SEGMENT_T
+            b_rel = tl.load(gate_rel + gate_base + rel_t, mask=m_t, other=0.0)
+            b_gate = tl.load(gate_abs + gate_base + rel_t, mask=m_t, other=0.0)
+            b_decay = tl.load(gate_decay + i_h * NT + i_t)
         else:
             last_rel = tl.minimum((i_t + 1) * BT, SEGMENT_T) - 1
             last_token = (BOS + last_rel).to(tl.int64)
@@ -1345,9 +1347,9 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
         nt = triton.cdiv(segment_t, chunk_size)
         if is_gdn:
             if K == 128 and V == 128 and q.dtype in (torch.bfloat16, torch.float16):
-                gate_rel = torch.empty((segment_t, HV), device=q.device, dtype=torch.float32)
-                gate_abs = torch.empty((segment_t, HV), device=q.device, dtype=torch.float32)
-                gate_decay = torch.empty((nt, HV), device=q.device, dtype=torch.float32)
+                gate_rel = torch.empty((HV, segment_t), device=q.device, dtype=torch.float32)
+                gate_abs = torch.empty((HV, segment_t), device=q.device, dtype=torch.float32)
+                gate_decay = torch.empty((HV, nt), device=q.device, dtype=torch.float32)
                 _launch_flat(
                     _cp_gdn_bwd_gate_factors_kernel,
                     HV * nt,
