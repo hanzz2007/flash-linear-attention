@@ -62,6 +62,7 @@ Test Scenarios:
 
 import logging
 import os
+import socket
 
 import pytest
 import torch
@@ -71,24 +72,26 @@ import torch.nn.functional as F
 
 from fla.ops.cp import build_cp_context
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-from fla.utils import assert_close
+from fla.utils import IS_NPU, assert_close, device, device_torch_lib
 
 # Configure logging to see assert_close messages
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
 
-def init_distributed(rank, world_size):
+def init_distributed(rank, world_size, port):
     """Initialize distributed environment for a single process."""
     logging.basicConfig(level=logging.INFO, format='%(message)s')
 
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '29502'  # Different port from KDA test
+    os.environ['MASTER_PORT'] = str(port)
     os.environ['RANK'] = str(rank)
     os.environ['WORLD_SIZE'] = str(world_size)
     os.environ['LOCAL_RANK'] = str(rank)
+    if IS_NPU:
+        os.environ.setdefault('HCCL_NPU_SOCKET_PORT_RANGE', 'auto')
 
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+    dist.init_process_group(backend='hccl' if IS_NPU else 'nccl', rank=rank, world_size=world_size)
+    device_torch_lib.set_device(rank)
 
 
 def cleanup_distributed():
@@ -108,14 +111,15 @@ def run_cp_gdn_test_worker(
     dtype,
     state_v_first: bool = False,
     Hq: int | None = None,
+    port: int = 29502,
 ):
     """
     Worker function for CP GDN test.
     Runs in a spawned process with the given rank.
     """
     try:
-        init_distributed(rank, world_size)
-        device = torch.device(f'cuda:{rank}')
+        init_distributed(rank, world_size, port)
+        worker_device = torch.device(device, rank)
 
         assert T % world_size == 0, f"T={T} must be divisible by world_size={world_size}"
         assert sum(lengths) == T, f"Sum of lengths {sum(lengths)} must equal T={T}"
@@ -130,23 +134,23 @@ def run_cp_gdn_test_worker(
         # Step 1: Prepare Global Data (all generated on rank 0, broadcast to all)
         B = 1
         Hq_actual = Hq if Hq is not None else H
-        q_global = torch.empty(B, T, Hq_actual, D, device=device, dtype=dtype)
-        k_global = torch.empty(B, T, Hq_actual, D, device=device, dtype=dtype)
-        v_global = torch.empty(B, T, H, D, device=device, dtype=dtype)
-        g_global = torch.empty(B, T, H, device=device, dtype=dtype)
-        beta_global = torch.empty(B, T, H, device=device, dtype=torch.float32)
-        do_global = torch.empty(B, T, H, D, device=device, dtype=dtype)
+        q_global = torch.empty(B, T, Hq_actual, D, device=worker_device, dtype=dtype)
+        k_global = torch.empty(B, T, Hq_actual, D, device=worker_device, dtype=dtype)
+        v_global = torch.empty(B, T, H, D, device=worker_device, dtype=dtype)
+        g_global = torch.empty(B, T, H, device=worker_device, dtype=dtype)
+        beta_global = torch.empty(B, T, H, device=worker_device, dtype=torch.float32)
+        do_global = torch.empty(B, T, H, D, device=worker_device, dtype=dtype)
 
         if rank == 0:
             torch.manual_seed(42)
-            q_global.copy_(F.normalize(torch.randn(B, T, Hq_actual, D, device=device,
+            q_global.copy_(F.normalize(torch.randn(B, T, Hq_actual, D, device=worker_device,
                            dtype=torch.float32), p=2, dim=-1).to(dtype))
-            k_global.copy_(F.normalize(torch.randn(B, T, Hq_actual, D, device=device,
+            k_global.copy_(F.normalize(torch.randn(B, T, Hq_actual, D, device=worker_device,
                            dtype=torch.float32), p=2, dim=-1).to(dtype))
-            v_global.copy_(torch.randn(B, T, H, D, device=device, dtype=dtype))
-            g_global.copy_(F.logsigmoid(torch.randn(B, T, H, device=device, dtype=dtype)))
-            beta_global.copy_(torch.randn(B, T, H, device=device, dtype=torch.float32).sigmoid())
-            do_global.copy_(torch.randn(B, T, H, D, device=device, dtype=dtype))
+            v_global.copy_(torch.randn(B, T, H, D, device=worker_device, dtype=dtype))
+            g_global.copy_(F.logsigmoid(torch.randn(B, T, H, device=worker_device, dtype=dtype)))
+            beta_global.copy_(torch.randn(B, T, H, device=worker_device, dtype=torch.float32).sigmoid())
+            do_global.copy_(torch.randn(B, T, H, D, device=worker_device, dtype=dtype))
 
         # Broadcast to ensure all ranks have same data
         dist.broadcast(q_global, src=0)
@@ -158,7 +162,7 @@ def run_cp_gdn_test_worker(
 
         # Prepare cu_seqlens
         cu_seqlens_list = [0] + torch.cumsum(torch.tensor(lengths), 0).tolist()
-        cu_seqlens_global = torch.tensor(cu_seqlens_list, device=device, dtype=torch.long)
+        cu_seqlens_global = torch.tensor(cu_seqlens_list, device=worker_device, dtype=torch.long)
 
         # Step 2: Reference Run (single GPU, varlen, no CP)
         ref_out = None
@@ -298,9 +302,12 @@ def run_cp_test_with_spawn(
     Run CP test using torch.multiprocessing.spawn.
     This allows running the test directly with pytest.
     """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
     mp.start_processes(
         run_cp_gdn_test_worker,
-        args=(world_size, test_name, T, H, D, lengths, dtype, state_v_first, Hq),
+        args=(world_size, test_name, T, H, D, lengths, dtype, state_v_first, Hq, port),
         nprocs=world_size,
         join=True,
         start_method='spawn',
@@ -313,7 +320,7 @@ def run_cp_test_with_spawn(
 
 def test_cp2_sequence_cut():
     """CP2: sequences cut across rank boundary."""
-    if torch.cuda.device_count() < 2:
+    if device_torch_lib.device_count() < 2:
         pytest.skip("At least 2 GPUs required")
 
     run_cp_test_with_spawn(
@@ -327,7 +334,7 @@ def test_cp2_sequence_cut():
 
 def test_cp2_boundary_aligned():
     """CP2: sequence boundaries aligned with rank boundaries."""
-    if torch.cuda.device_count() < 2:
+    if device_torch_lib.device_count() < 2:
         pytest.skip("At least 2 GPUs required")
 
     run_cp_test_with_spawn(
@@ -341,7 +348,7 @@ def test_cp2_boundary_aligned():
 
 def test_cp4_complex():
     """CP4: complex sequence distribution, first sequence spans 3 ranks."""
-    if torch.cuda.device_count() < 4:
+    if device_torch_lib.device_count() < 4:
         pytest.skip("At least 4 GPUs required")
 
     run_cp_test_with_spawn(
@@ -355,7 +362,7 @@ def test_cp4_complex():
 
 def test_cp4_single_sequence():
     """CP4: single long sequence spanning all ranks."""
-    if torch.cuda.device_count() < 4:
+    if device_torch_lib.device_count() < 4:
         pytest.skip("At least 4 GPUs required")
 
     run_cp_test_with_spawn(
@@ -369,7 +376,7 @@ def test_cp4_single_sequence():
 
 def test_cp8_single_sequence():
     """CP8: single long sequence spanning all ranks."""
-    if torch.cuda.device_count() < 8:
+    if device_torch_lib.device_count() < 8:
         pytest.skip("At least 8 GPUs required")
 
     run_cp_test_with_spawn(
@@ -383,7 +390,7 @@ def test_cp8_single_sequence():
 
 def test_cp2_many_short_sequences():
     """CP2: many short sequences."""
-    if torch.cuda.device_count() < 2:
+    if device_torch_lib.device_count() < 2:
         pytest.skip("At least 2 GPUs required")
 
     run_cp_test_with_spawn(
@@ -397,7 +404,7 @@ def test_cp2_many_short_sequences():
 
 def test_cp2_gqa_sequence_cut():
     """CP2 GQA: sequences cut across rank boundary, Hq < H."""
-    if torch.cuda.device_count() < 2:
+    if device_torch_lib.device_count() < 2:
         pytest.skip("At least 2 GPUs required")
 
     run_cp_test_with_spawn(
@@ -411,7 +418,7 @@ def test_cp2_gqa_sequence_cut():
 
 def test_cp2_gqa_single_sequence():
     """CP2 GQA: single long sequence with Hq < H."""
-    if torch.cuda.device_count() < 2:
+    if device_torch_lib.device_count() < 2:
         pytest.skip("At least 2 GPUs required")
 
     run_cp_test_with_spawn(
@@ -429,7 +436,7 @@ def test_cp2_gqa_single_sequence():
 
 def test_cp2_state_v_first():
     """CP2: state_v_first=True with sequence cut."""
-    if torch.cuda.device_count() < 2:
+    if device_torch_lib.device_count() < 2:
         pytest.skip("At least 2 GPUs required")
 
     run_cp_test_with_spawn(
@@ -444,7 +451,7 @@ def test_cp2_state_v_first():
 
 def test_cp4_state_v_first():
     """CP4: state_v_first=True with single long sequence."""
-    if torch.cuda.device_count() < 4:
+    if device_torch_lib.device_count() < 4:
         pytest.skip("At least 4 GPUs required")
 
     run_cp_test_with_spawn(
@@ -466,7 +473,7 @@ def setup_distributed_torchrun():
     if 'RANK' not in os.environ:
         return False
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend='hccl' if IS_NPU else 'nccl')
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+    device_torch_lib.set_device(local_rank)
     return True

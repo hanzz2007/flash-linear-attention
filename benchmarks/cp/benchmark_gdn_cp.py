@@ -207,6 +207,8 @@ def _measure(
 def main() -> None:
     args = _parse_args()
     backend = "hccl" if IS_NPU else "nccl"
+    if IS_NPU:
+        os.environ.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "auto")
     dist.init_process_group(backend=backend)
     rank = dist.get_rank()
     world_size = dist.get_world_size()

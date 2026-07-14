@@ -65,6 +65,8 @@ def _free_port() -> int:
 def _forward_worker(rank: int, world_size: int, state_v_first: bool, port: int) -> None:
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = str(port)
+    if IS_NPU:
+        os.environ.setdefault('HCCL_NPU_SOCKET_PORT_RANGE', 'auto')
     device_torch_lib.set_device(rank)
     backend = 'hccl' if IS_NPU else 'nccl'
     dist.init_process_group(backend, rank=rank, world_size=world_size)
