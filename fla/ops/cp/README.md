@@ -71,8 +71,8 @@ o_local, _ = chunk_kda(
 
 CP context stores **rank-local** varlen metadata that tracks how sequences are distributed:
 
-- `FLACPContext.cu_seqlens` — rank-local cumulative sequence lengths, on GPU (`int64`)
-- `FLACPContext.cu_seqlens_cpu` — same data on CPU for host-side indexing
+- `FLACPContext.cu_seqlens` — rank-local cumulative sequence lengths, on the accelerator (`int32`)
+- `FLACPContext.cu_seqlens_cpu` — the same `int32` data on CPU for host-side indexing
 
 Variable-length inputs start as global `cu_seqlens` **before** partitioning; `build_cp_context` converts them into rank-local metadata automatically.
 
