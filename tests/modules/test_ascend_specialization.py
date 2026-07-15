@@ -214,6 +214,30 @@ SPECIALIZATION_CONTRACTS = (
 ) + (
     SpecializationContract(
         path=_CONV,
+        kernel="causal_conv1d_fwd_dense_kernel",
+        runtime=frozenset({"T", "D", "B_OFFSET", "NT_OFFSET", "D_BLOCK_OFFSET"}),
+        constexpr=frozenset({"W", "BT", "BD"}),
+    ),
+    SpecializationContract(
+        path=_CONV,
+        kernel="causal_conv1d_dpre_dense_kernel",
+        runtime=frozenset({"T", "D", "B_OFFSET", "NT_OFFSET", "D_BLOCK_OFFSET"}),
+        constexpr=frozenset({"W", "BT", "BD"}),
+    ),
+    SpecializationContract(
+        path=_CONV,
+        kernel="causal_conv1d_dx_dense_kernel",
+        runtime=frozenset({"T", "D", "B_OFFSET", "NT_OFFSET", "D_BLOCK_OFFSET"}),
+        constexpr=frozenset({"W", "BT", "BD"}),
+    ),
+    SpecializationContract(
+        path=_CONV,
+        kernel="causal_conv1d_dh0_dense_kernel",
+        runtime=frozenset({"T", "D", "B_OFFSET", "D_BLOCK_OFFSET"}),
+        constexpr=frozenset({"W", "BD"}),
+    ),
+    SpecializationContract(
+        path=_CONV,
         kernel="causal_conv1d_fwd_kernel",
         runtime=frozenset({"T", "D", "B_OFFSET", "NT_OFFSET", "D_BLOCK_OFFSET"}),
         constexpr=frozenset({"W", "BT", "BD"}),

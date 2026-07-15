@@ -177,7 +177,7 @@ def _is_dense_single_sequence(
         "USE_INITIAL_STATE": lambda args: args["initial_state"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=["T", "D", "B_OFFSET", "NT_OFFSET", "D_BLOCK_OFFSET"])
 def causal_conv1d_fwd_dense_kernel(
     x,
     y,
@@ -185,25 +185,23 @@ def causal_conv1d_fwd_dense_kernel(
     bias,
     residual,
     initial_state,
-    T: tl.constexpr,
-    D: tl.constexpr,
+    T: tl.int64,
+    D: tl.int64,
     W: tl.constexpr,
-    NT: tl.constexpr,
-    DB: tl.constexpr,
+    B_OFFSET: tl.int64,
+    NT_OFFSET: tl.int64,
+    D_BLOCK_OFFSET: tl.int64,
     HAS_BIAS: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     USE_ACTIVATION: tl.constexpr,
-    TASK_OFFSET: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
 ):
-    """Compute one dense token/channel tile from a grid-safe 1D task."""
-    task = tl.program_id(0).to(tl.int64) + tl.cast(TASK_OFFSET, tl.int64)
-    batch = task // (NT * DB)
-    tile = task % (NT * DB)
-    time_block = tile // DB
-    channel_block = tile % DB
+    """Compute one dense token/channel tile from a grid-safe 3D task."""
+    channel_block = tl.program_id(0).to(tl.int64) + D_BLOCK_OFFSET
+    time_block = tl.program_id(1).to(tl.int64) + NT_OFFSET
+    batch = tl.program_id(2).to(tl.int64) + B_OFFSET
     t = time_block * BT + tl.arange(0, BT).to(tl.int64)
     d = channel_block * BD + tl.arange(0, BD).to(tl.int64)
     token_mask = t < T
@@ -247,15 +245,13 @@ def _launch_fwd_dense(
     activation: str | None,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Launch dense two-dimensional tiles from grid-safe 1D slices."""
+    """Launch dense two-dimensional tiles from grid-safe 3D slices."""
     B, T, D = x.shape
     NT = triton.cdiv(T, _FWD_DENSE_BT)
-    DB = triton.cdiv(D, _FWD_DENSE_BD)
-    n_tasks = B * NT * DB
     y = torch.empty_like(x, memory_format=torch.contiguous_format) if output is None else output
-    for task_off in range(0, n_tasks, _NPU_MAX_TRITON_GRID):
-        grid = min(_NPU_MAX_TRITON_GRID, n_tasks - task_off)
-        causal_conv1d_fwd_dense_kernel[(grid,)](
+    for b_off, b_len, nt_off, nt_len, d_off, d_len in _iter_3d_grid_splits(B, NT, D, _FWD_DENSE_BD):
+        grid = (d_len, nt_len, b_len)
+        causal_conv1d_fwd_dense_kernel[grid](
             x=x,
             y=y,
             weight=weight,
@@ -265,10 +261,10 @@ def _launch_fwd_dense(
             T=T,
             D=D,
             W=weight.shape[1],
-            NT=NT,
-            DB=DB,
+            B_OFFSET=b_off,
+            NT_OFFSET=nt_off,
+            D_BLOCK_OFFSET=d_off,
             USE_ACTIVATION=activation in ("swish", "silu"),
-            TASK_OFFSET=task_off,
             BT=_FWD_DENSE_BT,
             BD=_FWD_DENSE_BD,
             num_warps=_FWD_DENSE_WARPS,
@@ -313,7 +309,7 @@ def _is_dense_backward(
         "USE_INITIAL_STATE": lambda args: args["initial_state"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=["T", "D", "B_OFFSET", "NT_OFFSET", "D_BLOCK_OFFSET"])
 def causal_conv1d_dpre_dense_kernel(
     x,
     dy,
@@ -321,23 +317,21 @@ def causal_conv1d_dpre_dense_kernel(
     bias,
     initial_state,
     dpre,
-    T: tl.constexpr,
-    D: tl.constexpr,
+    T: tl.int64,
+    D: tl.int64,
     W: tl.constexpr,
-    NT: tl.constexpr,
-    DB: tl.constexpr,
+    B_OFFSET: tl.int64,
+    NT_OFFSET: tl.int64,
+    D_BLOCK_OFFSET: tl.int64,
     HAS_BIAS: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     USE_ACTIVATION: tl.constexpr,
-    TASK_OFFSET: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
 ):
-    task = tl.program_id(0).to(tl.int64) + tl.cast(TASK_OFFSET, tl.int64)
-    batch = task // (NT * DB)
-    tile = task % (NT * DB)
-    time_block = tile // DB
-    channel_block = tile % DB
+    channel_block = tl.program_id(0).to(tl.int64) + D_BLOCK_OFFSET
+    time_block = tl.program_id(1).to(tl.int64) + NT_OFFSET
+    batch = tl.program_id(2).to(tl.int64) + B_OFFSET
     t = time_block * BT + tl.arange(0, BT).to(tl.int64)
     d = channel_block * BD + tl.arange(0, BD).to(tl.int64)
     token_mask = t < T
@@ -370,25 +364,23 @@ def causal_conv1d_dpre_dense_kernel(
     tl.store(dpre + output_offset, gradient, mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T", "D", "B_OFFSET", "NT_OFFSET", "D_BLOCK_OFFSET"])
 def causal_conv1d_dx_dense_kernel(
     dpre,
     weight,
     dx,
-    T: tl.constexpr,
-    D: tl.constexpr,
+    T: tl.int64,
+    D: tl.int64,
     W: tl.constexpr,
-    NT: tl.constexpr,
-    DB: tl.constexpr,
-    TASK_OFFSET: tl.constexpr,
+    B_OFFSET: tl.int64,
+    NT_OFFSET: tl.int64,
+    D_BLOCK_OFFSET: tl.int64,
     BT: tl.constexpr,
     BD: tl.constexpr,
 ):
-    task = tl.program_id(0).to(tl.int64) + tl.cast(TASK_OFFSET, tl.int64)
-    batch = task // (NT * DB)
-    tile = task % (NT * DB)
-    time_block = tile // DB
-    channel_block = tile % DB
+    channel_block = tl.program_id(0).to(tl.int64) + D_BLOCK_OFFSET
+    time_block = tl.program_id(1).to(tl.int64) + NT_OFFSET
+    batch = tl.program_id(2).to(tl.int64) + B_OFFSET
     t = time_block * BT + tl.arange(0, BT).to(tl.int64)
     d = channel_block * BD + tl.arange(0, BD).to(tl.int64)
     token_mask = t < T
@@ -412,17 +404,20 @@ def causal_conv1d_dx_dense_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T", "D", "B_OFFSET", "D_BLOCK_OFFSET"])
 def causal_conv1d_dh0_dense_kernel(
     dpre,
     weight,
     dh0,
-    T: tl.constexpr,
-    D: tl.constexpr,
+    T: tl.int64,
+    D: tl.int64,
     W: tl.constexpr,
+    B_OFFSET: tl.int64,
+    D_BLOCK_OFFSET: tl.int64,
     BD: tl.constexpr,
 ):
-    channel_block = tl.program_id(0).to(tl.int64)
+    channel_block = tl.program_id(0).to(tl.int64) + D_BLOCK_OFFSET
+    batch = tl.program_id(1).to(tl.int64) + B_OFFSET
     d = channel_block * BD + tl.arange(0, BD).to(tl.int64)
     channel_mask = d < D
     for state_index in tl.static_range(0, W):
@@ -434,10 +429,10 @@ def causal_conv1d_dh0_dense_kernel(
                     mask=channel_mask,
                     other=0.0,
                 ).to(tl.float32)
-                gradient = tl.load(dpre + t * D + d, mask=channel_mask, other=0.0).to(tl.float32)
+                gradient = tl.load(dpre + (batch * T + t) * D + d, mask=channel_mask, other=0.0).to(tl.float32)
                 grad_state += gradient * coefficient
         tl.store(
-            dh0 + d * W + state_index,
+            dh0 + (batch * D + d) * W + state_index,
             tl.cast(grad_state, dtype=dh0.dtype.element_ty, fp_downcast_rounding="rtne"),
             mask=channel_mask,
         )
@@ -482,12 +477,10 @@ def _launch_bwd_dense(
     poison: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
     """Launch the dense backward pipeline without partial workspaces."""
-    _, T, D = x.shape
+    B, T, D = x.shape
     W = weight.shape[1]
     NT = triton.cdiv(T, _BWD_DENSE_BT)
-    DB = triton.cdiv(D, _BWD_DENSE_BD)
     num_warps = _dense_backward_num_warps(x, weight)
-    n_tasks = NT * DB
     fill = float("nan") if poison else None
     dpre = (
         torch.full_like(x, fill, dtype=torch.float32, memory_format=torch.contiguous_format)
@@ -499,16 +492,14 @@ def _launch_bwd_dense(
         T=T,
         D=D,
         W=W,
-        NT=NT,
-        DB=DB,
         BT=_BWD_DENSE_BT,
         BD=_BWD_DENSE_BD,
         num_warps=num_warps,
         multibuffer=False,
     )
-    for task_off in range(0, n_tasks, _NPU_MAX_TRITON_GRID):
-        grid = min(_NPU_MAX_TRITON_GRID, n_tasks - task_off)
-        causal_conv1d_dpre_dense_kernel[(grid,)](
+    for b_off, b_len, nt_off, nt_len, d_off, d_len in _iter_3d_grid_splits(B, NT, D, _BWD_DENSE_BD):
+        grid = (d_len, nt_len, b_len)
+        causal_conv1d_dpre_dense_kernel[grid](
             x=x,
             dy=dy,
             weight=weight,
@@ -516,18 +507,22 @@ def _launch_bwd_dense(
             initial_state=initial_state,
             dpre=dpre,
             USE_ACTIVATION=activation in ("silu", "swish"),
-            TASK_OFFSET=task_off,
+            B_OFFSET=b_off,
+            NT_OFFSET=nt_off,
+            D_BLOCK_OFFSET=d_off,
             **common,
         )
 
     dx = torch.full_like(x, fill) if poison else torch.empty_like(x)
-    for task_off in range(0, n_tasks, _NPU_MAX_TRITON_GRID):
-        grid = min(_NPU_MAX_TRITON_GRID, n_tasks - task_off)
-        causal_conv1d_dx_dense_kernel[(grid,)](
+    for b_off, b_len, nt_off, nt_len, d_off, d_len in _iter_3d_grid_splits(B, NT, D, _BWD_DENSE_BD):
+        grid = (d_len, nt_len, b_len)
+        causal_conv1d_dx_dense_kernel[grid](
             dpre=dpre,
             weight=weight,
             dx=dx,
-            TASK_OFFSET=task_off,
+            B_OFFSET=b_off,
+            NT_OFFSET=nt_off,
+            D_BLOCK_OFFSET=d_off,
             **common,
         )
 
@@ -544,17 +539,20 @@ def _launch_bwd_dense(
     dh0 = None
     if initial_state is not None:
         dh0 = torch.full_like(initial_state, fill) if poison else torch.empty_like(initial_state)
-        causal_conv1d_dh0_dense_kernel[(DB,)](
-            dpre=dpre,
-            weight=weight,
-            dh0=dh0,
-            T=T,
-            D=D,
-            W=W,
-            BD=_BWD_DENSE_BD,
-            num_warps=num_warps,
-            multibuffer=False,
-        )
+        for b_off, b_len, _, _, d_off, d_len in _iter_3d_grid_splits(B, 1, D, _BWD_DENSE_BD):
+            causal_conv1d_dh0_dense_kernel[(d_len, b_len)](
+                dpre=dpre,
+                weight=weight,
+                dh0=dh0,
+                T=T,
+                D=D,
+                W=W,
+                B_OFFSET=b_off,
+                D_BLOCK_OFFSET=d_off,
+                BD=_BWD_DENSE_BD,
+                num_warps=num_warps,
+                multibuffer=False,
+            )
     return dx, dw, db, dh0, dpre
 
 

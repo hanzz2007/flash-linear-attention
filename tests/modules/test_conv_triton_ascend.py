@@ -489,6 +489,34 @@ def test_general_grid_splits_cover_each_task_once(monkeypatch):
     assert any(d_start > 0 for *_, d_start, _ in conv_backend._iter_3d_grid_splits(B, NT, D, BD))
 
 
+def test_dense_grid_split_matches_unsplit(monkeypatch):
+    import fla.modules.backends.triton_ascend.causal_conv1d as conv_backend
+
+    torch.manual_seed(42)
+    B, T, D, W = 2, 65, 257, 4
+    x = torch.randn(B, T, D, dtype=torch.bfloat16, device=device) * 0.1
+    dy = torch.randn_like(x) * 0.1
+    weight = torch.randn(D, W, dtype=torch.bfloat16, device=device) * 0.1
+    bias = torch.randn(D, dtype=torch.bfloat16, device=device) * 0.1
+    residual = torch.randn_like(x) * 0.1
+    initial_state = torch.randn(B, D, W, dtype=torch.bfloat16, device=device) * 0.1
+
+    def run(max_grid: int):
+        monkeypatch.setattr(conv_backend, "_get_npu_max_grid", lambda: max_grid)
+        output = conv_backend._launch_fwd_dense(x, weight, bias, residual, initial_state, "silu")
+        backward = conv_backend._launch_bwd_dense(x, dy, weight, bias, initial_state, "silu")
+        return output, backward
+
+    baseline_output, baseline_backward = run(conv_backend._NPU_MAX_TRITON_GRID)
+    split_output, split_backward = run(2)
+
+    _assert_strict_close(baseline_output, split_output, ratio=1e-7, name="dense split output")
+    for name, baseline, split in zip(
+        ("dx", "dw", "db", "dh0", "dpre"), baseline_backward, split_backward, strict=True
+    ):
+        _assert_strict_close(baseline, split, ratio=1e-7, name=f"dense split {name}")
+
+
 def test_short_sequence_backward_respects_grid_limit(monkeypatch):
     import fla.modules.backends.triton_ascend.causal_conv1d as conv_backend
 
