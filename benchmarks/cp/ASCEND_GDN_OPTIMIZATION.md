@@ -120,3 +120,19 @@ The remaining bounded candidates were rejected on measured end-to-end or compone
 The raw CP8 all-gather was also measured under the CANN 9.0 execution modes supported by [`HCCL_OP_EXPANSION_MODE`](https://www.hiascend.com/document/detail/zh/canncommercial/900/maintenref/envvar/envref_07_0096.html): default `HOST` was `0.353 ms`, `AI_CPU` was `0.427 ms`, and `HOST_TS` was `1.139 ms`. `AIV` reached `0.315 ms`, but the official documentation restricts that mode to inference and notes additional topology and communicator limitations, so it is not promoted for this training path. The default `HOST` mode remains the fastest supported training configuration.
 
 No HCCL buffer-size or algorithm override is justified for this single-server case. The [`HCCL_BUFFSIZE`](https://www.hiascend.com/document/detail/zh/canncommercial/900/maintenref/envvar/envref_07_0080.html) default is 200 MiB and already greatly exceeds the approximately 1 MiB per-rank payload. The CANN 9.0 [`HCCL_ALGO`](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/maintenref/envvar/envref_07_0079.html) description applies to inter-server or supernode levels; the server-internal level-0 algorithm is `NA` and is selected internally. Consequently, Stage 5 promotes no new production candidate. The existing switchable `high` and shape-limited `a800` paths remain intact, and meeting the absolute A800 latency target now requires authorization to change the frozen communication protocol or a future compiler/runtime improvement rather than a further unbounded precision relaxation.
+
+### Stage 6: Final regression and requirement audit
+
+The final audit added a tracked NPU-only CP8 public test at the exact promoted shape so that `a800` cannot silently fall back to `high`: `Tglobal=16384,H=HV=8,K=V=128,BT=64,BF16`, with all eight physical devices and `Tlocal=2048`. Every rank confirmed the `a800` selector. Output and `dq` matched the independent same-device reference exactly; the observed RMS ratios for `dk/dv/dg/db` were `5e-6/3e-6/1e-5/4e-6`, all far below the frozen public `<3e-3` gate.
+
+| Audit gate | Result | Status |
+| ---------- | ------ | ------ |
+| Local static checks | Ruff, `py_compile`, and `git diff --check` clean | pass |
+| A800 CUDA routing | Precision selector and CP4 normal/V-first references, 3/3 | pass |
+| 910B high primitives | Selector plus BF16/FP16, K256, tail, long-scan, and range cases, 7/7 | pass |
+| 910B promoted CP8 public path | Exact target output and all gradients, 1/1 on devices 0-7 | pass |
+| Local/remote source identity | Production kernel, test, and benchmark SHA-256 values match | pass |
+| High-precision branch retained | Default `high`; unsupported `a800` shapes fall back to it | pass |
+| GDN absolute A800 performance | Final 910B/A800 latency ratios remain 2.306-3.139 forward and 2.531-2.664 backward | fail |
+
+The implementation, correctness coverage, dual-precision control, CUDA routing, and eight-card reproducibility are complete. KDA and DPLR/RWKV7 remain correctness-only as scoped. The performance objective is explicitly not complete: no reviewed candidate under the frozen FP32 all-gather protocol reaches A800 latency, and no failed precision or performance candidate remains in production source.

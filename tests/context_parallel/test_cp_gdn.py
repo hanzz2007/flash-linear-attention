@@ -453,6 +453,22 @@ def test_cp8_single_sequence():
     )
 
 
+@pytest.mark.skipif(not IS_NPU, reason="Ascend A800-parity precision coverage")
+def test_cp8_a800_precision_path(monkeypatch: pytest.MonkeyPatch):
+    """CP8: exercise the promoted Ascend A800-parity specialization."""
+    if device_torch_lib.device_count() < 8:
+        pytest.skip("At least 8 NPUs required")
+    monkeypatch.setenv("FLA_ASCEND_CP_GDN_PRECISION", "a800")
+
+    run_cp_test_with_spawn(
+        world_size=8,
+        test_name="CP8_A800Precision",
+        T=16384, H=8, D=128,
+        lengths=[16384],
+        dtype=torch.bfloat16,
+    )
+
+
 def test_cp2_many_short_sequences():
     """CP2: many short sequences."""
     if device_torch_lib.device_count() < 2:
