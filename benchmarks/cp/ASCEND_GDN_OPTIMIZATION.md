@@ -102,3 +102,21 @@ Production-equivalent single-device diagnostics include gate precomputation and 
 The CP8 row uses the promoted BF16 dM specialization; CP2/CP4-sized backward rows automatically use `high`. Precomputed H/M timings include the shared gate launch, so they diagnose the production schedule but are not additive. The old standalone H/M modes recompute gates inside each scan and are deliberately excluded from this table.
 
 An exclusive eight-card decomposition of the unchanged FP32 summary protocol measured a `0.353 ms` all-gather median, `0.284/0.286 ms` forward/backward merge medians, and `0.482/0.495 ms` combined communication-plus-merge medians. These are slowest-rank values; stage maxima are not additive because the boundary rank that has the longest merge skips the local summary. Nevertheless, the collective alone consumes 81% of the `0.433 ms` CP8 forward budget and 77% of the `0.457 ms` backward budget implied by the 1.10x A800 target. Local scans and the fixed distributed path must both improve; an H/dH-only change cannot meet the absolute target. The HCCL dtype, shape, collective count, and rank order remain unchanged.
+
+### Stage 5: Bounded H/dH, merge, and HCCL alternatives
+
+The two-way associative scan was evaluated first because it was the smallest relaxation of the serial H/dH recurrence. Its CP8 H/dH RMS ratios were `1.771e-3/1.810e-3`, above the A800+10% caps of `5.640e-4/1.494e-3`. Transition composition remained accurate (`M=3.876e-7`, high-precision `dM=3.916e-7`), confirming that H/dH recurrence rounding, rather than transition composition, is the blocker. Native BF16 dM segment composition increased dM error to `3.364e-3` without bringing dH inside its cap. The candidate was rejected before timing and the serial `high` path was left unchanged.
+
+The remaining bounded candidates were rejected on measured end-to-end or component performance:
+
+| Candidate | Correctness or support result | Measurement | Decision |
+| --------- | ----------------------------- | ----------: | -------- |
+| Forward H-only BV64 specialization | Arithmetic unchanged | `0.903 ms` local forward vs `0.849 ms` BV128 | Reject: 6.4% slower |
+| Recompute backward gate factors inside the fused kernel | Public arithmetic unchanged | `1.381 ms` local backward vs `0.742 ms` with precompute | Reject: duplicated `exp2` across 16 output tiles |
+| Preallocate all-gather output | Wire protocol unchanged | `0.404 ms` raw collective vs `0.353 ms` dynamic output | Reject: no allocation win and worse tails |
+| FP16 rank-chain merge | `5.188e-4`, inside the A800+10% merge envelope | `0.270 ms` vs `0.222 ms` FP32 | Reject: 21.6% slower |
+| BF16 rank-chain merge | `3.318e-3`, above the `2.814e-3` A800+10% merge cap | `0.267 ms` vs `0.222 ms` FP32 | Reject on both precision and speed |
+
+The raw CP8 all-gather was also measured under the CANN 9.0 execution modes supported by [`HCCL_OP_EXPANSION_MODE`](https://www.hiascend.com/document/detail/zh/canncommercial/900/maintenref/envvar/envref_07_0096.html): default `HOST` was `0.353 ms`, `AI_CPU` was `0.427 ms`, and `HOST_TS` was `1.139 ms`. `AIV` reached `0.315 ms`, but the official documentation restricts that mode to inference and notes additional topology and communicator limitations, so it is not promoted for this training path. The default `HOST` mode remains the fastest supported training configuration.
+
+No HCCL buffer-size or algorithm override is justified for this single-server case. The [`HCCL_BUFFSIZE`](https://www.hiascend.com/document/detail/zh/canncommercial/900/maintenref/envvar/envref_07_0080.html) default is 200 MiB and already greatly exceeds the approximately 1 MiB per-rank payload. The CANN 9.0 [`HCCL_ALGO`](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/maintenref/envvar/envref_07_0079.html) description applies to inter-server or supernode levels; the server-internal level-0 algorithm is `NA` and is selected internally. Consequently, Stage 5 promotes no new production candidate. The existing switchable `high` and shape-limited `a800` paths remain intact, and meeting the absolute A800 latency target now requires authorization to change the frozen communication protocol or a future compiler/runtime improvement rather than a further unbounded precision relaxation.
