@@ -1,0 +1,755 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>FLA GDN CP · Ascend 910B 优化总结</title>
+  <style>
+    :root {
+      --bg: #07111f;
+      --bg-soft: #0a1728;
+      --panel: #0f2035;
+      --panel-2: #122942;
+      --line: #27415d;
+      --text: #eaf3ff;
+      --muted: #99acc1;
+      --cyan: #42d3ff;
+      --blue: #6f8cff;
+      --green: #4de3a0;
+      --amber: #ffca68;
+      --red: #ff7285;
+      --a800: #6f8cff;
+      --npu: #42d3ff;
+      --shadow: 0 18px 55px rgba(0, 0, 0, .24);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 88% 0%, rgba(66, 211, 255, .13), transparent 29rem),
+        radial-gradient(circle at 5% 18%, rgba(111, 140, 255, .12), transparent 32rem),
+        var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.55;
+    }
+
+    a { color: var(--cyan); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .shell {
+      width: min(1760px, calc(100% - 48px));
+      margin: 0 auto;
+      padding: 30px 0 72px;
+    }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 24px;
+      margin-bottom: 22px;
+      color: var(--muted);
+      font-size: 13px;
+      letter-spacing: .04em;
+    }
+
+    .brand { color: var(--text); font-weight: 750; }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 7px 12px;
+      background: rgba(15, 32, 53, .72);
+    }
+
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+    .pass { color: var(--green); }
+    .warn { color: var(--amber); }
+    .fail { color: var(--red); }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      min-height: 400px;
+      padding: 50px 54px;
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background:
+        linear-gradient(125deg, rgba(18, 41, 66, .98), rgba(10, 23, 40, .95)),
+        var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      right: -130px;
+      top: -170px;
+      width: 540px;
+      height: 540px;
+      border: 70px solid rgba(66, 211, 255, .07);
+      border-radius: 50%;
+    }
+
+    .eyebrow {
+      color: var(--cyan);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 1100px;
+      margin: 13px 0 16px;
+      font-size: clamp(40px, 4.7vw, 76px);
+      line-height: 1.06;
+      letter-spacing: -.045em;
+    }
+
+    .hero p {
+      max-width: 1050px;
+      margin: 0;
+      color: #b6c8d9;
+      font-size: 18px;
+    }
+
+    .hero-status {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 28px;
+    }
+
+    .kpis {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 34px;
+    }
+
+    .kpi {
+      min-height: 110px;
+      padding: 18px;
+      border: 1px solid rgba(103, 137, 170, .35);
+      border-radius: 16px;
+      background: rgba(7, 17, 31, .52);
+      backdrop-filter: blur(10px);
+    }
+
+    .kpi .label { color: var(--muted); font-size: 12px; }
+    .kpi .value { margin: 4px 0; font-size: 28px; font-weight: 850; }
+    .kpi .sub { color: var(--muted); font-size: 12px; }
+
+    .section { margin-top: 28px; }
+
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 20px;
+      margin: 0 4px 13px;
+    }
+
+    h2 { margin: 0; font-size: 26px; letter-spacing: -.02em; }
+    h3 { margin: 0 0 13px; font-size: 18px; }
+    .section-head p { margin: 0; color: var(--muted); font-size: 13px; }
+
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 18px; }
+
+    .card {
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: linear-gradient(145deg, rgba(15, 32, 53, .98), rgba(10, 24, 41, .98));
+      box-shadow: 0 10px 32px rgba(0, 0, 0, .13);
+    }
+
+    .card.compact { padding: 18px 20px; }
+    .muted { color: var(--muted); }
+    .small { font-size: 12px; }
+
+    .verdict {
+      display: grid;
+      grid-template-columns: 1.15fr .85fr;
+      gap: 18px;
+    }
+
+    .verdict-main {
+      display: grid;
+      grid-template-columns: 105px 1fr;
+      gap: 20px;
+      align-items: center;
+    }
+
+    .score-ring {
+      display: grid;
+      place-items: center;
+      width: 102px;
+      height: 102px;
+      border-radius: 50%;
+      background: conic-gradient(var(--green) 0 76%, var(--red) 76% 100%);
+    }
+
+    .score-ring::before {
+      content: "5 / 7";
+      display: grid;
+      place-items: center;
+      width: 74px;
+      height: 74px;
+      border-radius: 50%;
+      background: var(--panel);
+      font-weight: 850;
+      font-size: 18px;
+    }
+
+    .checks { display: grid; gap: 9px; }
+    .check {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      padding-bottom: 8px;
+      border-bottom: 1px dashed rgba(65, 91, 119, .55);
+      font-size: 13px;
+    }
+    .check:last-child { border: 0; padding: 0; }
+
+    .architecture {
+      display: grid;
+      grid-template-columns: 1fr 56px 1.25fr 56px 1fr 56px 1fr;
+      align-items: stretch;
+      gap: 8px;
+    }
+
+    .node {
+      min-height: 140px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 19px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: rgba(18, 41, 66, .72);
+    }
+
+    .node strong { margin-bottom: 7px; color: var(--cyan); }
+    .node span { color: var(--muted); font-size: 12px; }
+
+    .fork { display: grid; gap: 9px; }
+    .fork .node { min-height: 66px; padding: 12px 15px; }
+
+    .arrow { display: grid; place-items: center; color: var(--cyan); font-size: 27px; }
+
+    .precision {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .mode {
+      padding: 15px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(7, 17, 31, .36);
+    }
+    .mode strong { display: block; margin-bottom: 5px; }
+
+    .latency-chart {
+      height: 340px;
+      display: grid;
+      grid-template-columns: repeat(6, minmax(72px, 1fr));
+      align-items: end;
+      gap: 18px;
+      padding: 28px 20px 0;
+      border-left: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      background: repeating-linear-gradient(
+        to top,
+        transparent 0,
+        transparent 67px,
+        rgba(63, 91, 121, .24) 68px
+      );
+    }
+
+    .bar-group {
+      height: 100%;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      align-items: end;
+      gap: 7px;
+      position: relative;
+      padding-bottom: 36px;
+    }
+
+    .bar-group .name {
+      position: absolute;
+      bottom: 7px;
+      left: 0;
+      right: 0;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+    }
+
+    .bar {
+      position: relative;
+      min-height: 8px;
+      height: var(--h);
+      border-radius: 7px 7px 2px 2px;
+      background: var(--c);
+      box-shadow: 0 0 22px color-mix(in srgb, var(--c) 25%, transparent);
+    }
+
+    .bar::before {
+      content: attr(data-v);
+      position: absolute;
+      left: 50%;
+      top: -22px;
+      transform: translateX(-50%);
+      color: var(--text);
+      font-size: 11px;
+      font-weight: 750;
+    }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 0 0 18px; font-size: 12px; }
+    .legend i { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 6px; }
+
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 11px 12px; border-bottom: 1px solid rgba(58, 83, 110, .55); text-align: left; }
+    th { color: #c6d5e5; font-size: 12px; }
+    td { font-size: 13px; }
+    td.num, th.num { text-align: right; }
+    tr:last-child td { border-bottom: 0; }
+
+    .meter-list { display: grid; gap: 14px; }
+    .meter-row { display: grid; grid-template-columns: 130px 1fr 58px; gap: 12px; align-items: center; }
+    .track { height: 12px; overflow: hidden; border-radius: 999px; background: rgba(72, 100, 130, .24); }
+    .fill { height: 100%; width: var(--w); border-radius: inherit; background: var(--c, var(--cyan)); }
+    .meter-row .value { text-align: right; font-size: 12px; font-weight: 800; }
+
+    .efficiency-cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+    .eff-card { padding: 18px; border: 1px solid var(--line); border-radius: 15px; background: rgba(7,17,31,.34); }
+    .eff-card .big { margin: 7px 0 3px; font-size: 33px; font-weight: 900; }
+
+    .gain-chart { display: grid; gap: 13px; }
+    .gain-row { display: grid; grid-template-columns: 190px 1fr 72px; gap: 12px; align-items: center; }
+    .gain-row .track { height: 18px; }
+
+    .budget-grid { display: grid; gap: 14px; }
+    .budget-row { display: grid; grid-template-columns: 150px 1fr 75px; gap: 13px; align-items: center; }
+    .budget-bar { height: 22px; border-radius: 6px; background: rgba(66, 211, 255, .82); width: var(--w); }
+    .budget-row.target .budget-bar { background: var(--amber); }
+
+    .callout {
+      padding: 18px 20px;
+      border-left: 4px solid var(--amber);
+      border-radius: 4px 14px 14px 4px;
+      background: rgba(255, 202, 104, .08);
+      color: #e9d9b5;
+      font-size: 13px;
+    }
+
+    .error-gauge {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .error-cell {
+      padding: 15px 10px;
+      text-align: center;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: rgba(7, 17, 31, .33);
+    }
+    .error-cell b { display: block; margin-top: 4px; color: var(--green); font-size: 18px; }
+    .error-cell span { color: var(--muted); font-size: 11px; }
+
+    .opt-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    .opt {
+      min-height: 150px;
+      padding: 17px;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: rgba(7, 17, 31, .35);
+    }
+    .opt .gain { margin: 10px 0 4px; color: var(--green); font-size: 23px; font-weight: 900; }
+    .opt p { margin: 0; color: var(--muted); font-size: 12px; }
+
+    .timeline { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; }
+    .phase {
+      position: relative;
+      padding: 17px;
+      border-top: 3px solid var(--cyan);
+      border-radius: 8px 8px 15px 15px;
+      background: rgba(15, 32, 53, .9);
+    }
+    .phase b { display: block; margin-bottom: 7px; }
+    .phase code { color: var(--cyan); font-size: 11px; }
+    .phase p { margin: 7px 0 0; color: var(--muted); font-size: 11px; }
+
+    .next { border-color: var(--amber); }
+    .next ol { margin: 11px 0 0 20px; padding: 0; }
+    .next li { margin: 8px 0; color: #cbd9e7; }
+
+    footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      margin-top: 34px;
+      padding: 20px 4px 0;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    code {
+      padding: 2px 5px;
+      border-radius: 5px;
+      background: rgba(7, 17, 31, .62);
+      color: #cfe9ff;
+    }
+
+    @media (max-width: 1180px) {
+      .kpis, .grid-4, .opt-grid { grid-template-columns: repeat(2, 1fr); }
+      .grid-3 { grid-template-columns: 1fr; }
+      .architecture { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); min-height: 30px; }
+      .timeline { grid-template-columns: repeat(3, 1fr); }
+      .latency-chart { overflow-x: auto; }
+    }
+
+    @media (max-width: 760px) {
+      .shell { width: min(100% - 24px, 1760px); padding-top: 12px; }
+      .hero { padding: 30px 22px; border-radius: 19px; }
+      .kpis, .grid-2, .grid-4, .opt-grid, .verdict, .precision { grid-template-columns: 1fr; }
+      .timeline { grid-template-columns: 1fr; }
+      .topbar, footer { align-items: flex-start; flex-direction: column; }
+      .error-gauge { grid-template-columns: repeat(2, 1fr); }
+      .gain-row, .meter-row, .budget-row { grid-template-columns: 1fr; }
+      .latency-chart { min-width: 720px; }
+    }
+
+    @media print {
+      :root { --bg: #fff; --panel: #fff; --panel-2: #f3f6fa; --text: #142033; --muted: #53657a; --line: #c9d3de; }
+      body { background: #fff; }
+      .shell { width: 100%; padding: 0; }
+      .hero, .card { box-shadow: none; background: #fff; break-inside: avoid; }
+      .hero { min-height: auto; }
+      .section { break-inside: avoid; }
+      .kpi, .node, .mode, .opt, .phase, .eff-card, .error-cell { background: #f7f9fc; }
+      a { color: #1558a6; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="topbar">
+      <div><span class="brand">FLA / Context Parallel</span> · Engineering Optimization Review</div>
+      <div class="pill"><span class="dot pass"></span> 证据截至 commit <code>ceefc1ea</code></div>
+    </div>
+
+    <header class="hero">
+      <div class="eyebrow">Ascend 910B × 8 · NVIDIA A800 × 8</div>
+      <h1>GDN Context Parallel<br>迁移与性能优化总结</h1>
+      <p>
+        完成 Triton-Ascend 专用 H/M/dH/dM 与 rank merge、双精度分支、CP2/4/8 验证和完整负结果审计。
+        正确性与工程门禁通过；绝对性能仍未达到 A800，报告不隐藏该差距。
+      </p>
+      <div class="hero-status">
+        <span class="pill pass"><span class="dot"></span>实现完成</span>
+        <span class="pill pass"><span class="dot"></span>CP8 正确性通过</span>
+        <span class="pill pass"><span class="dot"></span>high 分支保留</span>
+        <span class="pill fail"><span class="dot"></span>A800 绝对性能未达标</span>
+      </div>
+      <div class="kpis">
+        <div class="kpi"><div class="label">CP8 910B Forward</div><div class="value">1.237 ms</div><div class="sub">A800 0.394 ms · 3.139×</div></div>
+        <div class="kpi"><div class="label">CP8 910B Backward</div><div class="value">1.052 ms</div><div class="sub">A800 0.416 ms · 2.531×</div></div>
+        <div class="kpi"><div class="label">CP8 Backward Scaling</div><div class="value pass">70.2%</div><div class="sub">A800 67.2% · +3.0 pp</div></div>
+        <div class="kpi"><div class="label">Public Worst RMS</div><div class="value pass">1e-5</div><div class="sub">门限 3e-3 · 使用 0.33%</div></div>
+        <div class="kpi"><div class="label">A800-precision Gain</div><div class="value pass">8.4–8.6%</div><div class="sub">CP8 backward 配对测量</div></div>
+      </div>
+    </header>
+
+    <section class="section verdict">
+      <article class="card verdict-main">
+        <div class="score-ring" aria-label="7 项总门禁中 5 项通过"></div>
+        <div>
+          <h3>结论：工程可交付，性能目标未闭环</h3>
+          <p class="muted">
+            数据通路、正确性、CUDA 回归、双精度控制和 8 卡可复现性通过；绝对 latency 与 throughput 两项失败。
+            KDA/DPLR 按范围保持 correctness-only。
+          </p>
+        </div>
+      </article>
+      <article class="card checks">
+        <div class="check"><span>Public output / gradients &lt; 3e-3</span><b class="pass">PASS</b></div>
+        <div class="check"><span>High primitives &lt; 1e-4</span><b class="pass">PASS</b></div>
+        <div class="check"><span>A800 CUDA regression ≤ 2%</span><b class="pass">PASS</b></div>
+        <div class="check"><span>CP8 backward scaling</span><b class="pass">PASS</b></div>
+        <div class="check"><span>CP8 forward scaling</span><b class="warn">MISS 0.8 pp</b></div>
+        <div class="check"><span>910B latency ≤ 1.10× A800</span><b class="fail">FAIL</b></div>
+        <div class="check"><span>910B throughput ≥ 90% A800</span><b class="fail">FAIL</b></div>
+      </article>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>01 · 最终架构</h2>
+        <p>UB-aware decomposition · compile-time precision · ordered FP32 merge</p>
+      </div>
+      <article class="card">
+        <div class="architecture" aria-label="GDN CP Ascend 数据流">
+          <div class="node"><strong>Gate Precompute</strong><span>连续 gate factor 与 chunk decay；避免每个 output tile 重复 exp2。</span></div>
+          <div class="arrow">→</div>
+          <div class="fork">
+            <div class="node"><strong>Persistent H / fused dH</strong><span>FP32 recurrent state · value tiling</span></div>
+            <div class="node"><strong>Factorized M / dM</strong><span>B@M → Aᵀ@TMP · 无 K×K UB 中间量</span></div>
+          </div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>FP32 Summary</strong><span>[HV, K, V+K] · HCCL all-gather · wire shape/count 不变</span></div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>Persistent Rank Merge</strong><span>ordered M@state+H · FP32 accumulation · normal/V-first</span></div>
+        </div>
+        <div class="precision">
+          <div class="mode"><strong class="pass">high · 默认</strong><span class="muted small">H/dH/M/dM、payload、merge 保持高精度；覆盖全部支持 shape。</span></div>
+          <div class="mode"><strong class="warn">a800 · opt-in</strong><span class="muted small">仅 BF16 K=V=128,Tlocal=2048 backward dM 使用 BF16 Cube；其他情况自动回退 high。</span></div>
+        </div>
+      </article>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>02 · 已提升优化与局部效果</h2>
+        <p>同阶段配对结果；各项不可直接相加</p>
+      </div>
+      <div class="opt-grid">
+        <article class="opt"><b>UB-aware 64-column tile</b><div class="gain">-39% / -41%</div><p>CP2 forward/backward；随后按方向选择 H=128、dH=64、M/dM=128。</p></article>
+        <article class="opt"><b>H/M 双 stream</b><div class="gain">-29.7%</div><p>CP2 forward；backward 同期改善 3.3%，以显式事件保持依赖。</p></article>
+        <article class="opt"><b>Persistent rank merge</b><div class="gain">-14.3% / -11.4%</div><p>CP8 forward/backward；BV16→32 再追加 3.4%/4.1%。</p></article>
+        <article class="opt"><b>Fused dH / dM</b><div class="gain">-15% 至 -22%</div><p>CP2/4/8 backward；共享输入加载并减少 block 数。</p></article>
+        <article class="opt"><b>Gate precompute</b><div class="gain">1.86× faster</div><p>相对 fused kernel 内重复 gate；重算方案 1.381 ms vs 0.742 ms。</p></article>
+        <article class="opt"><b>Skip overwritten memset</b><div class="gain">最高 -4.6%</div><p>CP2 forward；CP8 backward 改善 1.9%–2.7%，保留 neutral state 初始化。</p></article>
+        <article class="opt"><b>a800 BF16 dM</b><div class="gain">-8.4% 至 -8.6%</div><p>CP8 backward 配对测量；dH 与 recurrent dM state 不变。</p></article>
+        <article class="opt"><b>总体迭代量级</b><div class="gain">4.91× / 4.79×</div><p>早期 CP2 serial checkpoint 到最终 forward/backward；采样协议不同，仅作轨迹参考。</p></article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>03 · 最终延迟对标</h2>
+        <p>5 warmups / 30 samples · slowest-rank median · 吞吐率使用未截断样本 · 编译排除</p>
+      </div>
+      <div class="grid-2">
+        <article class="card">
+          <div class="legend"><span><i style="background:var(--a800)"></i>A800</span><span><i style="background:var(--npu)"></i>910B</span><span class="muted">单位：ms</span></div>
+          <div class="latency-chart" role="img" aria-label="A800 与 910B CP2 CP4 CP8 前反向延迟柱状图">
+            <div class="bar-group"><div class="bar" style="--h:31.7%;--c:var(--a800)" data-v="0.793"></div><div class="bar" style="--h:73.1%;--c:var(--npu)" data-v="1.828"></div><div class="name">FWD · CP2</div></div>
+            <div class="bar-group"><div class="bar" style="--h:20.8%;--c:var(--a800)" data-v="0.520"></div><div class="bar" style="--h:54.5%;--c:var(--npu)" data-v="1.363"></div><div class="name">FWD · CP4</div></div>
+            <div class="bar-group"><div class="bar" style="--h:15.8%;--c:var(--a800)" data-v="0.394"></div><div class="bar" style="--h:49.5%;--c:var(--npu)" data-v="1.237"></div><div class="name">FWD · CP8</div></div>
+            <div class="bar-group"><div class="bar" style="--h:34.4%;--c:var(--a800)" data-v="0.861"></div><div class="bar" style="--h:91.7%;--c:var(--npu)" data-v="2.293"></div><div class="name">BWD · CP2</div></div>
+            <div class="bar-group"><div class="bar" style="--h:22.4%;--c:var(--a800)" data-v="0.559"></div><div class="bar" style="--h:59.1%;--c:var(--npu)" data-v="1.477"></div><div class="name">BWD · CP4</div></div>
+            <div class="bar-group"><div class="bar" style="--h:16.6%;--c:var(--a800)" data-v="0.416"></div><div class="bar" style="--h:42.1%;--c:var(--npu)" data-v="1.052"></div><div class="name">BWD · CP8</div></div>
+          </div>
+        </article>
+        <article class="card">
+          <h3>吞吐保留率 · 目标 90%</h3>
+          <div class="meter-list">
+            <div class="meter-row"><span>CP2 Forward</span><div class="track"><div class="fill" style="--w:43.4%;--c:var(--cyan)"></div></div><div class="value">43.4%</div></div>
+            <div class="meter-row"><span>CP4 Forward</span><div class="track"><div class="fill" style="--w:38.1%;--c:var(--cyan)"></div></div><div class="value">38.1%</div></div>
+            <div class="meter-row"><span>CP8 Forward</span><div class="track"><div class="fill" style="--w:31.9%;--c:var(--cyan)"></div></div><div class="value">31.9%</div></div>
+            <div class="meter-row"><span>CP2 Backward</span><div class="track"><div class="fill" style="--w:37.5%;--c:var(--blue)"></div></div><div class="value">37.5%</div></div>
+            <div class="meter-row"><span>CP4 Backward</span><div class="track"><div class="fill" style="--w:37.8%;--c:var(--blue)"></div></div><div class="value">37.8%</div></div>
+            <div class="meter-row"><span>CP8 Backward</span><div class="track"><div class="fill" style="--w:39.5%;--c:var(--blue)"></div></div><div class="value">39.5%</div></div>
+            <div class="meter-row"><span class="warn">Acceptance</span><div class="track"><div class="fill" style="--w:90%;--c:var(--amber)"></div></div><div class="value warn">90%</div></div>
+          </div>
+          <div class="callout" style="margin-top:20px">
+            最终 910B latency 为 A800 的 2.306–3.139×（forward）和 2.531–2.664×（backward）。
+            所有绝对 latency/throughput 门槛均未通过。
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>04 · 强扩展效率</h2>
+        <p>efficiency = CP4 latency / (2 × CP8 latency)</p>
+      </div>
+      <div class="grid-2">
+        <article class="card">
+          <h3>Forward · CP4 → CP8</h3>
+          <div class="efficiency-cards">
+            <div class="eff-card"><span class="muted small">A800</span><div class="big" style="color:var(--a800)">65.9%</div><span class="small muted">reference</span></div>
+            <div class="eff-card"><span class="muted small">910B</span><div class="big warn">55.1%</div><span class="small muted">-10.8 pp · miss 0.8 pp</span></div>
+          </div>
+        </article>
+        <article class="card">
+          <h3>Backward · CP4 → CP8</h3>
+          <div class="efficiency-cards">
+            <div class="eff-card"><span class="muted small">A800</span><div class="big" style="color:var(--a800)">67.2%</div><span class="small muted">reference</span></div>
+            <div class="eff-card"><span class="muted small">910B</span><div class="big pass">70.2%</div><span class="small muted">+3.0 pp · pass</span></div>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>05 · CP8 关键路径分解</h2>
+        <p>production-equivalent component medians · stage maxima 不可直接相加</p>
+      </div>
+      <div class="grid-2">
+        <article class="card">
+          <h3>Forward component vs A800+10% budget</h3>
+          <div class="budget-grid">
+            <div class="budget-row"><span>Local summary</span><div class="budget-bar" style="--w:94.3%"></div><b>0.849</b></div>
+            <div class="budget-row"><span>FP32 all-gather</span><div class="budget-bar" style="--w:39.2%"></div><b>0.353</b></div>
+            <div class="budget-row"><span>Merge</span><div class="budget-bar" style="--w:31.6%"></div><b>0.284</b></div>
+            <div class="budget-row"><span>Comm + merge</span><div class="budget-bar" style="--w:53.6%"></div><b>0.482</b></div>
+            <div class="budget-row target"><span>总预算</span><div class="budget-bar" style="--w:48.1%"></div><b>0.433</b></div>
+          </div>
+        </article>
+        <article class="card">
+          <h3>Backward component vs A800+10% budget</h3>
+          <div class="budget-grid">
+            <div class="budget-row"><span>Local summary</span><div class="budget-bar" style="--w:82.4%"></div><b>0.742</b></div>
+            <div class="budget-row"><span>FP32 all-gather</span><div class="budget-bar" style="--w:39.2%"></div><b>0.353</b></div>
+            <div class="budget-row"><span>Merge</span><div class="budget-bar" style="--w:31.8%"></div><b>0.286</b></div>
+            <div class="budget-row"><span>Comm + merge</span><div class="budget-bar" style="--w:55.0%"></div><b>0.495</b></div>
+            <div class="budget-row target"><span>总预算</span><div class="budget-bar" style="--w:50.8%"></div><b>0.457</b></div>
+          </div>
+        </article>
+      </div>
+      <div class="callout" style="margin-top:14px">
+        FP32 all-gather 单项已经占用 A800 对标 forward/backward 总预算的 81%/77%；local summary 单项也高于总预算。
+        因此仅优化 H/dH 或仅调 HCCL 环境变量无法闭合绝对性能目标。
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>06 · 精度与正确性</h2>
+        <p>CP8 exact promoted shape · all 8 physical devices</p>
+      </div>
+      <div class="grid-2">
+        <article class="card">
+          <h3>Public RMS ratio · 门限 3e-3</h3>
+          <div class="error-gauge">
+            <div class="error-cell"><span>output</span><b>0</b></div>
+            <div class="error-cell"><span>dq</span><b>0</b></div>
+            <div class="error-cell"><span>dk</span><b>5e-6</b></div>
+            <div class="error-cell"><span>dv</span><b>3e-6</b></div>
+            <div class="error-cell"><span>dg</span><b>1e-5</b></div>
+            <div class="error-cell"><span>dbeta</span><b>4e-6</b></div>
+          </div>
+          <p class="muted small" style="margin-top:15px">最差值仅使用公共误差预算的 0.33%；每个 rank 均确认命中 a800 selector。</p>
+        </article>
+        <article class="card">
+          <h3>Coverage</h3>
+          <table>
+            <tr><td>CP / layout</td><td class="num pass">CP2/4/8 · normal/V-first</td></tr>
+            <tr><td>Sequence</td><td class="num pass">dense · varlen · tail · non-zero BOS</td></tr>
+            <tr><td>Shape</td><td class="num pass">GVA · K≠V · K96 · K128 · K256</td></tr>
+            <tr><td>dtype / BT</td><td class="num pass">BF16 · FP16 · BT16/32/64</td></tr>
+            <tr><td>Safety</td><td class="num pass">NaN poisoning · finite · large offset</td></tr>
+            <tr><td>Other modes</td><td class="num warn">KDA/DPLR · correctness-only</td></tr>
+          </table>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>07 · 被否决候选</h2>
+        <p>失败候选均回退；无试验代码残留在 production source</p>
+      </div>
+      <article class="card">
+        <table>
+          <thead><tr><th>候选</th><th>局部/数值结果</th><th>端到端或支持性结论</th><th>决策</th></tr></thead>
+          <tbody>
+            <tr><td>Forward FP16/BF16 Cube M</td><td>isolated M +4.4%/+5.7%</td><td>CP8 慢 1.2%/7.5%；Cube 与 H 竞争</td><td class="fail">Reject</td></tr>
+            <tr><td>Four-way H/dH segmentation</td><td>CP8 快约 6%/11%</td><td>H/dH 2.47e-3/2.44e-3，超 A800+10%</td><td class="fail">Reject</td></tr>
+            <tr><td>Two-way H/dH segmentation</td><td>M/dM ≈ 4e-7</td><td>H/dH 1.771e-3/1.810e-3，仍超 cap</td><td class="fail">Reject</td></tr>
+            <tr><td>Segment M only</td><td>isolated M 快 26.4%</td><td>CP8 慢 15.8%；资源竞争</td><td class="fail">Reject</td></tr>
+            <tr><td>H-only BV64</td><td>arithmetic unchanged</td><td>local forward 慢 6.4%</td><td class="fail">Reject</td></tr>
+            <tr><td>Gate recompute in fused bwd</td><td>duplicated exp2 × 16 tiles</td><td>1.381 ms vs precompute 0.742 ms</td><td class="fail">Reject</td></tr>
+            <tr><td>Async / preallocated all-gather</td><td>wire unchanged</td><td>无 overlap；分别回退 4.7% / 14.4%</td><td class="fail">Reject</td></tr>
+            <tr><td>FP16/BF16 merge</td><td>FP16 precision pass</td><td>两者均比 FP32 慢；BF16 precision fail</td><td class="fail">Reject</td></tr>
+            <tr><td>HCCL AIV</td><td>0.315 ms vs HOST 0.353 ms</td><td>官方仅支持推理，不能作为训练默认</td><td class="warn">Do not promote</td></tr>
+          </tbody>
+        </table>
+      </article>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>08 · 分阶段提交与可审计性</h2>
+        <p>20 个提交 · 10 个 tracked 文件 · +3,466 / -71</p>
+      </div>
+      <div class="timeline">
+        <div class="phase"><b>1 · Port</b><code>65aa7c16</code><p>Forward H/M、NPU routing 与 merge 初版。</p></div>
+        <div class="phase"><b>2 · Correctness</b><code>f342ada1 · 492083b1</code><p>Device-neutral HCCL/NCCL tests 与覆盖矩阵。</p></div>
+        <div class="phase"><b>3 · Core perf</b><code>3633558c</code><p>UB tile、persistent transition 与 stream overlap。</p></div>
+        <div class="phase"><b>4 · Merge / Bwd</b><code>c2b4bba9 · 8e1e7eeb</code><p>Persistent chain 与 fused dH/dM。</p></div>
+        <div class="phase"><b>5 · Precision</b><code>419e244b</code><p>保留 high，新增 shape-limited a800。</p></div>
+        <div class="phase"><b>6 · Audit</b><code>ceefc1ea</code><p>Exact CP8 promoted-path public gate。</p></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>09 · 后续建议</h2>
+        <p>需要显式扩大冻结协议范围</p>
+      </div>
+      <div class="grid-2">
+        <article class="card next">
+          <h3>若继续冲击 A800</h3>
+          <ol>
+            <li>仅在 opt-in a800 模式研究压缩 summary wire，FP32 解包与 merge；high 完全不变。</li>
+            <li>评估 hierarchical/pipelined scan 或 custom fused collective，减少重复 rank-chain work。</li>
+            <li>在更新 CANN/triton-ascend 上重测 FP32 dot、persistent scan 与 stream overlap。</li>
+            <li>任何协议变更重新执行 CP2/4/8 correctness、poisoning、CUDA regression 和 5/30 矩阵。</li>
+          </ol>
+        </article>
+        <article class="card">
+          <h3>不建议</h3>
+          <div class="checks">
+            <div class="check"><span>仅凭 public 3e-3 提升 segmented H/dH</span><b class="fail">No</b></div>
+            <div class="check"><span>把 isolated microbenchmark 当端到端收益</span><b class="fail">No</b></div>
+            <div class="check"><span>训练默认使用 inference-only AIV</span><b class="fail">No</b></div>
+            <div class="check"><span>隐藏未达到 A800 的最终结论</span><b class="fail">No</b></div>
+            <div class="check"><span>保留可切换 high fallback</span><b class="pass">Required</b></div>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <footer>
+      <span>FLA GDN CP · Ascend 910B Optimization Summary</span>
+      <span>
+        <a href="ASCEND_GDN_OPTIMIZATION_SUMMARY.md">Markdown 报告</a> ·
+        <a href="ASCEND_GDN_OPTIMIZATION.md">详细优化记录</a> ·
+        <a href="../../fla/ops/cp/README.md">CP 数学与接口</a>
+      </span>
+    </footer>
+  </main>
+</body>
+</html>
