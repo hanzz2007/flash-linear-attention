@@ -58,3 +58,25 @@ The unmodified A800 backward dM ratios are `1.476e-3` for `K=V=128,BT=32,T=70,in
 The BF16-both path improves paired eight-card backward medians by 8.4% and 8.6%. Its CP8 dM error is about 16% of the A800 error, and the public CP8 output/all-gradient test passes with a worst observed RMS ratio of `5e-6`. The short-sequence BF16 result is outside the A800+10% envelope, so dispatch is deliberately limited to BF16 `K=V=128,Tlocal=2048`; every other dtype, dimension, and local length uses `high` even when the environment requests `a800`.
 
 A periodic mixed FP32/BF16 update was also rejected before timing: a runtime branch over loop-carried dM state silently produced an `8.65e4` error ratio on the CP8 case under the current compiler. The promoted kernel contains no runtime arithmetic branch; `A800_PRECISION` is a compile-time specialization.
+
+### Stage 3: Final CP2/CP4/CP8 matrix after precision promotion
+
+The final matrix uses five warmups and 30 samples per direction. CP2/CP4 use physical devices starting at device 2; CP8 exclusively uses all eight physical devices. Values are slowest-rank wall-clock medians in milliseconds.
+
+| CP size | A800 fwd | 910B fwd | 910B/A800 | A800 bwd | 910B bwd | 910B/A800 |
+| ------: | -------: | -------: | --------: | --------: | --------: | --------: |
+|       2 |    0.793 |    1.828 |     2.306 |     0.861 |     2.293 |     2.664 |
+|       4 |    0.520 |    1.363 |     2.623 |     0.559 |     1.477 |     2.645 |
+|       8 |    0.394 |    1.237 |     3.139 |     0.416 |     1.052 |     2.531 |
+
+The corresponding 910B throughput is 43.4%/37.5% of A800 at CP2, 38.1%/37.8% at CP4, and 31.9%/39.5% at CP8 for forward/backward. The final A800 medians are within 2% of or faster than the frozen baseline in every case, so the CUDA regression gate passes.
+
+| Gate | Result | Status |
+| ---- | ------ | ------ |
+| Public GDN output/all gradients `<3e-3` | CP8 `a800` worst observed ratio `5e-6`; CP4 fallback and high primitives pass | pass |
+| 910B latency `<=1.10x` A800 | Ratios are 2.306-3.139 forward and 2.531-2.664 backward | fail |
+| 910B throughput `>=90%` A800 | 31.9%-43.4% | fail |
+| A800 CUDA regression `<=2%` | All six final medians are no slower than the frozen baselines | pass |
+| CP4-to-CP8 efficiency within 10 percentage points of A800 | Forward 55.1% vs 65.9% (10.8 pp gap); backward 70.2% vs 67.2% | forward fail; backward pass |
+
+Median variability was low except for isolated high-tail samples in A800 CP4 backward and 910B CP4 forward/CP8 backward. Their medians, p10, and p90 remain clustered; the full logs retain CV values rather than discarding the outliers. The performance objective is not complete after this stage, and further work must target the H/dH scan and fixed distributed overhead rather than further relaxing transition precision.
