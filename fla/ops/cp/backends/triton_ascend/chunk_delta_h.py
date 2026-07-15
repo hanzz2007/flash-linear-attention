@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,6 +28,27 @@ if TYPE_CHECKING:
 
 _NUM_WARPS = 4
 _SUMMARY_STREAMS: dict[int, object] = {}
+_GDN_PRECISION_ENV = 'FLA_ASCEND_CP_GDN_PRECISION'
+_GDN_PRECISION_MODES = ('high', 'a800')
+
+
+def _gdn_precision_mode() -> str:
+    mode = os.environ.get(_GDN_PRECISION_ENV, 'high').lower()
+    if mode not in _GDN_PRECISION_MODES:
+        choices = ', '.join(_GDN_PRECISION_MODES)
+        raise ValueError(f'{_GDN_PRECISION_ENV} must be one of {choices}, but got {mode!r}')
+    return mode
+
+
+def _use_a800_transition_precision(
+    *,
+    precision_mode: str,
+    dtype: torch.dtype,
+    K: int,
+    V: int,
+    segment_t: int,
+) -> bool:
+    return precision_mode == 'a800' and dtype == torch.bfloat16 and K == V == 128 and segment_t == 2048
 
 
 def _summary_stream(tensor: torch.Tensor):
@@ -641,6 +663,7 @@ def _cp_gdn_bwd_fused_128_kernel(
     HV: tl.constexpr,
     BT: tl.constexpr,
     PRECOMPUTED_GATE: tl.constexpr,
+    A800_PRECISION: tl.constexpr,
     TASK_OFFSET: tl.constexpr,
 ):
     """Compute dH and dM together for the K=V=128 critical path."""
@@ -697,8 +720,12 @@ def _cp_gdn_bwd_fused_128_kernel(
 
         b_kg1 = (b_k1.to(tl.float32) * b_rel[:, None]).to(b_k1.dtype)
         b_kg2 = (b_k2.to(tl.float32) * b_rel[:, None]).to(b_k2.dtype)
-        b_tmp = tl.dot(b_kg1.to(tl.float32), b_m1, allow_tf32=False)
-        b_tmp += tl.dot(b_kg2.to(tl.float32), b_m2, allow_tf32=False)
+        if A800_PRECISION:
+            b_tmp = tl.dot(b_kg1, b_m1.to(b_kg1.dtype), allow_tf32=False)
+            b_tmp += tl.dot(b_kg2, b_m2.to(b_kg2.dtype), allow_tf32=False)
+        else:
+            b_tmp = tl.dot(b_kg1.to(tl.float32), b_m1, allow_tf32=False)
+            b_tmp += tl.dot(b_kg2.to(tl.float32), b_m2, allow_tf32=False)
 
         p_do = do + token[:, None] * (HV * 128) + i_h * 128 + o_c[None, :]
         b_do = tl.load(p_do, mask=m_t[:, None], other=0.0)
@@ -722,8 +749,12 @@ def _cp_gdn_bwd_fused_128_kernel(
         b_dh2 += _dot_fp32_low_rhs(b_qg2, b_do) * scale
         b_dh2 -= tl.dot(b_w2, b_dv.to(b_w2.dtype), allow_tf32=False)
 
-        b_m1 = b_decay * b_m1 - tl.dot(b_w1.to(tl.float32), b_tmp, allow_tf32=False)
-        b_m2 = b_decay * b_m2 - tl.dot(b_w2.to(tl.float32), b_tmp, allow_tf32=False)
+        if A800_PRECISION:
+            b_m1 = b_decay * b_m1 - tl.dot(b_w1, b_tmp.to(b_w1.dtype), allow_tf32=False)
+            b_m2 = b_decay * b_m2 - tl.dot(b_w2, b_tmp.to(b_w2.dtype), allow_tf32=False)
+        else:
+            b_m1 = b_decay * b_m1 - tl.dot(b_w1.to(tl.float32), b_tmp, allow_tf32=False)
+            b_m2 = b_decay * b_m2 - tl.dot(b_w2.to(tl.float32), b_tmp, allow_tf32=False)
 
     dhm_base = (i_h * 128 * 256).to(tl.int64)
     p_dh = dhm + dhm_base + k1[:, None] * 256 + o_c[None, :]
@@ -1333,6 +1364,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
     is_dplr = g is None and gk is not None and bg is not None
     if not (is_gdn or is_kda or is_dplr):
         raise ValueError('Unsupported Ascend CP gate combination.')
+    precision_mode = _gdn_precision_mode() if is_gdn else 'high'
     assert dht is None, 'When enable CP, the provided dht must be None.'
     if not dist.is_initialized():
         raise RuntimeError('CP requires an initialized process group')
@@ -1398,6 +1430,13 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
                     HV=HV,
                     BT=chunk_size,
                     PRECOMPUTED_GATE=True,
+                    A800_PRECISION=_use_a800_transition_precision(
+                        precision_mode=precision_mode,
+                        dtype=q.dtype,
+                        K=K,
+                        V=V,
+                        segment_t=segment_t,
+                    ),
                 )
             else:
                 current_stream = device_torch_lib.current_stream(q.device)

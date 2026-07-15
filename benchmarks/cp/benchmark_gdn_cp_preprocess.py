@@ -232,6 +232,11 @@ def main() -> None:
     os.environ.setdefault('TRITON_CACHE_DIR', f'/tmp/fla-triton-cache-{device}-{device_key}')
     if IS_NPU:
         os.environ.setdefault('HCCL_NPU_SOCKET_PORT_RANGE', 'auto')
+        from fla.ops.cp.backends.triton_ascend.chunk_delta_h import _gdn_precision_mode
+
+        precision = _gdn_precision_mode()
+    else:
+        precision = 'cuda'
     device_torch_lib.set_device(local_rank)
     dist.init_process_group(backend='hccl' if IS_NPU else 'nccl', timeout=timedelta(minutes=20))
     rank = dist.get_rank()
@@ -292,6 +297,7 @@ def main() -> None:
             'world_size': world_size,
             'direction': args.direction,
             'component': args.component,
+            'precision': precision,
             'dtype': args.dtype,
             'total_seq_len': args.total_seq_len,
             'local_seq_len': local_seq_len,

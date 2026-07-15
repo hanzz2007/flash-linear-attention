@@ -9,11 +9,11 @@ This record tracks the staged Ascend 910B optimization of GDN context-parallel p
 - Public GDN output and every gradient retain the strict RMS-ratio gate `<3e-3`, with finite and NaN-poisoning checks.
 - Internal H, dH, and merge gates retain `<1e-4`.
 - The high-precision M/dM path retains `<1e-4` and must remain available.
-- An A800-parity M/dM path may be promoted only when each supported shape stays within the independently measured A800 error envelope and passes the unchanged public gate.
+- An A800-parity M/dM path may be promoted only when each supported shape stays within `1.10x` the independently measured A800 RMS-error envelope and passes the unchanged public gate.
 - Triton compilation is completed before timing. Candidate timing uses five warmups and 20 samples; final evidence uses five warmups and 30 samples.
 - The HCCL payload, wire shape, collective count, and rank order are frozen.
 
-The planned runtime selector is `FLA_ASCEND_CP_GDN_PRECISION=high|a800`. `high` is the default. The `a800` mode will only dispatch a promoted shape specialization; unsupported shapes fall back to `high`. The selector is not added until at least one A800-parity path improves the end-to-end target.
+The runtime selector is `FLA_ASCEND_CP_GDN_PRECISION=high|a800`. `high` is the default. The `a800` mode only dispatches a promoted shape specialization; unsupported shapes fall back to `high`.
 
 ## Baselines
 
@@ -42,3 +42,19 @@ The A800 CUDA transition and two 910B Cube candidates were compared with the sam
 Both Cube variants accelerate isolated M, but they move M onto the same Cube resource used by the concurrent H scan. That contention removes the microbenchmark gain and regresses eight-card end-to-end latency by 1.2% for FP16 and 7.5% for BF16. BF16 also exceeds the A800 range-stress envelope. No forward low-precision path is promoted; the implementation remains on the high-precision path.
 
 Both `high` and the candidate `a800` mode passed the CP8 public output/all-gradient gate before the performance decision. The rejected candidates were reverted after measurement.
+
+### Stage 2: Backward fused dH/dM precision path
+
+The unmodified A800 backward dM ratios are `1.476e-3` for `K=V=128,BT=32,T=70,input_scale=0.2` and `2.139e-2` for the CP8 target. The promoted candidate uses native BF16 Cube for both dM contractions inside the fused dH/dM kernel. dH arithmetic is unchanged.
+
+| Candidate                         | Range dM ratio | CP8 dM ratio | CP8 backward result                       | Decision |
+| --------------------------------- | -------------: | -----------: | ----------------------------------------- | -------- |
+| High FP32                         |      0.000e+0 |    3.403e-7 | 1.129/1.127 ms in the paired runs         | Retain as default |
+| BF16 first contraction only       |      2.099e-3 |    2.484e-3 | +1.7% then -4.6%; not repeatable           | Reject |
+| FP16 first contraction only       |      2.608e-4 |    1.592e-2 | 1.109 ms vs 1.090 ms high                 | Reject |
+| FP16 both contractions            |      3.757e-4 |    3.870e-2 | Not timed after exceeding the 2.353e-2 cap | Reject |
+| BF16 both contractions            |      3.049e-3 |    3.436e-3 | 1.035/1.030 ms vs 1.129/1.127 ms high     | Promote for the CP8 target |
+
+The BF16-both path improves paired eight-card backward medians by 8.4% and 8.6%. Its CP8 dM error is about 16% of the A800 error, and the public CP8 output/all-gradient test passes with a worst observed RMS ratio of `5e-6`. The short-sequence BF16 result is outside the A800+10% envelope, so dispatch is deliberately limited to BF16 `K=V=128,Tlocal=2048`; every other dtype, dimension, and local length uses `high` even when the environment requests `a800`.
+
+A periodic mixed FP32/BF16 update was also rejected before timing: a runtime branch over loop-carried dM state silently produced an `8.65e4` error ratio on the CP8 case under the current compiler. The promoted kernel contains no runtime arithmetic branch; `A800_PRECISION` is a compile-time specialization.

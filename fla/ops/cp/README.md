@@ -372,6 +372,12 @@ $$\mathbf{S}_r = \mathbf{M}_{r-1} (\mathbf{M}_{r-2} (\cdots \mathbf{S}_{\text{ex
 > [!IMPORTANT]
 > The $\mathbf{M}$ chain multiply must stay in **fp32** to avoid accumulated precision loss. In bf16, repeatedly casting fp32 accumulators back to bf16 between iterations causes significant error growth over many chunks.
 
+### Ascend GDN precision modes
+
+The Ascend GDN CP backend accepts `FLA_ASCEND_CP_GDN_PRECISION=high|a800`. The default `high` mode keeps both transition contractions in fp32 and is the general correctness path. The opt-in `a800` mode currently specializes only the backward BF16 `K=V=128,Tlocal=2048` path: its two local dM contractions use BF16 Cube while the recurrent dM accumulator, H/dH calculations, cross-rank payload, and merge chain remain fp32. Every unsupported dtype, dimension, or local length automatically uses `high`.
+
+The specialized path is gated against an independent fp32 recurrence, the measured A800 error envelope, and the unchanged public output/all-gradient tolerance. See [`benchmarks/cp/ASCEND_GDN_OPTIMIZATION.md`](../../../benchmarks/cp/ASCEND_GDN_OPTIMIZATION.md) for the numerical and eight-card performance evidence.
+
 ---
 
 ## Initial State Memory Optimization
