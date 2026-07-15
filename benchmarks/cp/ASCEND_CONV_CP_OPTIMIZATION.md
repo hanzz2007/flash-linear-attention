@@ -203,4 +203,4 @@ The unchanged target dense path was remeasured with three warmups and ten sample
 
 Cold process compile time was 14.343 s and was excluded from every warm sample. The 0.66% lower candidate median is within normal run-to-run variation and is recorded only as evidence that the dense target path did not regress.
 
-Stage 7 implementation commit: `pending`.
+Stage 7 implementation commit: `62f5d24e`.
