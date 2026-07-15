@@ -19,6 +19,9 @@ STATIC_WARPS = 2
 # Ascend Triton rejects grids whose product exceeds 65535 (see fla/modules/token_shift.py).
 _NPU_MAX_TRITON_GRID = 65535
 _ELEM_BLOCK = 2048
+_FWD_DENSE_BT = 64
+_FWD_DENSE_BD = 128
+_FWD_DENSE_WARPS = 2
 
 
 def _elementwise_launch_iters(numel: int):
@@ -104,6 +107,148 @@ def _npu_bwd_tile_config(
         BD = 8
         BT = 32
     return BD, BT, STATIC_WARPS
+
+
+def _is_dense_single_sequence(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    cu_seqlens_cpu: torch.Tensor | None,
+) -> bool:
+    """Return whether the contiguous Ascend forward kernel can preserve semantics."""
+    if x.dim() != 3 or not x.is_contiguous() or x.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    B, T, D = x.shape
+    W = weight.shape[1]
+    if W not in (2, 3, 4) or weight.shape != (D, W) or not weight.is_contiguous():
+        return False
+    if bias is not None and (bias.shape != (D,) or not bias.is_contiguous()):
+        return False
+    if residual is not None and (residual.shape != x.shape or not residual.is_contiguous()):
+        return False
+    if initial_state is not None and (
+        initial_state.shape != (B, D, W) or not initial_state.is_contiguous()
+    ):
+        return False
+    if cu_seqlens is None:
+        return True
+    if cu_seqlens_cpu is None or cu_seqlens_cpu.device.type != 'cpu' or cu_seqlens_cpu.numel() != 2:
+        return False
+    bos, eos = cu_seqlens_cpu.tolist()
+    return bos == 0 and eos == T
+
+
+@triton.heuristics({
+    'HAS_BIAS': lambda args: args['bias'] is not None,
+    'HAS_RESIDUAL': lambda args: args['residual'] is not None,
+    'USE_INITIAL_STATE': lambda args: args['initial_state'] is not None,
+})
+@triton.jit
+def causal_conv1d_fwd_dense_kernel(
+    x,
+    y,
+    weight,
+    bias,
+    residual,
+    initial_state,
+    T: tl.constexpr,
+    D: tl.constexpr,
+    W: tl.constexpr,
+    NT: tl.constexpr,
+    DB: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    USE_ACTIVATION: tl.constexpr,
+    TASK_OFFSET: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """Compute one dense token/channel tile from a grid-safe 1D task."""
+    task = tl.program_id(0).to(tl.int64) + tl.cast(TASK_OFFSET, tl.int64)
+    batch = task // (NT * DB)
+    tile = task % (NT * DB)
+    time_block = tile // DB
+    channel_block = tile % DB
+    t = time_block * BT + tl.arange(0, BT).to(tl.int64)
+    d = channel_block * BD + tl.arange(0, BD).to(tl.int64)
+    token_mask = t < T
+    channel_mask = d < D
+    output_mask = token_mask[:, None] & channel_mask[None, :]
+    output_offset = (batch * T + t[:, None]) * D + d[None, :]
+
+    acc = tl.zeros((BT, BD), dtype=tl.float32)
+    for tap in tl.static_range(0, W):
+        source_t = t + tap - W + 1
+        source_mask = token_mask[:, None] & (source_t >= 0)[:, None] & channel_mask[None, :]
+        source_offset = (batch * T + source_t[:, None]) * D + d[None, :]
+        source = tl.load(x + source_offset, mask=source_mask, other=0.).to(tl.float32)
+        if USE_INITIAL_STATE:
+            state_index = source_t + W
+            state_mask = (
+                token_mask[:, None]
+                & (source_t < 0)[:, None]
+                & (state_index >= 0)[:, None]
+                & channel_mask[None, :]
+            )
+            state_offset = (batch * D + d[None, :]) * W + state_index[:, None]
+            source += tl.load(initial_state + state_offset, mask=state_mask, other=0.).to(tl.float32)
+        coefficient = tl.load(weight + d * W + tap, mask=channel_mask, other=0.).to(tl.float32)
+        acc += source * coefficient[None, :]
+
+    if HAS_BIAS:
+        acc += tl.load(bias + d, mask=channel_mask, other=0.).to(tl.float32)[None, :]
+    if USE_ACTIVATION:
+        acc *= tl.sigmoid(acc)
+    if HAS_RESIDUAL:
+        acc += tl.load(residual + output_offset, mask=output_mask, other=0.).to(tl.float32)
+    tl.store(
+        y + output_offset,
+        tl.cast(acc, dtype=y.dtype.element_ty, fp_downcast_rounding='rtne'),
+        mask=output_mask,
+    )
+
+
+def _launch_fwd_dense(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    initial_state: torch.Tensor | None,
+    activation: str | None,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Launch dense two-dimensional tiles from grid-safe 1D slices."""
+    B, T, D = x.shape
+    NT = triton.cdiv(T, _FWD_DENSE_BT)
+    DB = triton.cdiv(D, _FWD_DENSE_BD)
+    n_tasks = B * NT * DB
+    y = torch.empty_like(x, memory_format=torch.contiguous_format) if output is None else output
+    for task_off in range(0, n_tasks, _NPU_MAX_TRITON_GRID):
+        grid = min(_NPU_MAX_TRITON_GRID, n_tasks - task_off)
+        causal_conv1d_fwd_dense_kernel[(grid,)](
+            x=x,
+            y=y,
+            weight=weight,
+            bias=bias,
+            residual=residual,
+            initial_state=initial_state,
+            T=T,
+            D=D,
+            W=weight.shape[1],
+            NT=NT,
+            DB=DB,
+            USE_ACTIVATION=activation in ('swish', 'silu'),
+            TASK_OFFSET=task_off,
+            BT=_FWD_DENSE_BT,
+            BD=_FWD_DENSE_BD,
+            num_warps=_FWD_DENSE_WARPS,
+            multibuffer=False,
+        )
+    return y
 
 
 @triton.heuristics({
@@ -842,14 +987,25 @@ def causal_conv1d_fwd_npu(
     B, T, D = x.shape[0], x.shape[1], weight.shape[0]
     W = weight.shape[1]
 
-    BD, BT, num_warps = _npu_tile_config(T, BT, D, x.dtype, initial_state)
-    if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
+    if _is_dense_single_sequence(
+        x=x,
+        weight=weight,
+        bias=bias,
+        residual=residual,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+    ):
+        y = _launch_fwd_dense(x, weight, bias, residual, initial_state, activation)
+    else:
+        BD, BT, num_warps = _npu_tile_config(T, BT, D, x.dtype, initial_state)
+        if cu_seqlens is not None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
 
-    y = _launch_fwd_core(
-        x, weight, bias, initial_state, cu_seqlens, chunk_indices, B, T, D, W, BT, BD, num_warps,
-    )
-    y = _postprocess_fwd(y, residual, activation)
+        y = _launch_fwd_core(
+            x, weight, bias, initial_state, cu_seqlens, chunk_indices, B, T, D, W, BT, BD, num_warps,
+        )
+        y = _postprocess_fwd(y, residual, activation)
 
     final_state = None
     if output_final_state:
