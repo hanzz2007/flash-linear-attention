@@ -174,4 +174,4 @@ CP8 correctness passes on both HCCL/910B and NCCL/A800 for D1024 and D3072. The 
 
 The first cold distributed specializations took about 14 s on the 910B stack and 38 s on the A800 stack. Compilation is reported independently and excluded from every warm latency sample.
 
-Stage 5 commit: pending.
+Stage 5 commit: `a2c0be63`.
