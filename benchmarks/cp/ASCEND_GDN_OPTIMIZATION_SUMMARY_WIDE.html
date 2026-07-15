@@ -590,23 +590,82 @@
 
     <section class="section">
       <div class="section-head">
-        <h2>04 · 强扩展效率</h2>
-        <p>efficiency = CP4 latency / (2 × CP8 latency)</p>
+        <h2>04 · A800 效率差距深析</h2>
+        <p>same-workload throughput · scaling efficiency · CP8 closure budget</p>
+      </div>
+      <div class="callout" style="margin-bottom:14px">
+        本节“效率”指同工作负载吞吐保留率和分布式强扩展效率，不代表理论 FLOPS、HBM 带宽或能效；当前没有两种硬件上可直接对比的峰值计数器。
       </div>
       <div class="grid-2">
         <article class="card">
-          <h3>Forward · CP4 → CP8</h3>
-          <div class="efficiency-cards">
-            <div class="eff-card"><span class="muted small">A800</span><div class="big" style="color:var(--a800)">65.9%</div><span class="small muted">reference</span></div>
-            <div class="eff-card"><span class="muted small">910B</span><div class="big warn">55.1%</div><span class="small muted">-10.8 pp · miss 0.8 pp</span></div>
-          </div>
+          <h3>Forward · 绝对效率差距</h3>
+          <table>
+            <thead><tr><th>CP</th><th class="num">延迟差</th><th class="num">910B/A800</th><th class="num">保留率</th><th class="num">效率损失</th></tr></thead>
+            <tbody>
+              <tr><td>2</td><td class="num">+1.035 ms</td><td class="num">2.306×</td><td class="num">43.4%</td><td class="num fail">56.6 pp</td></tr>
+              <tr><td>4</td><td class="num">+0.843 ms</td><td class="num">2.623×</td><td class="num">38.1%</td><td class="num fail">61.9 pp</td></tr>
+              <tr><td>8</td><td class="num">+0.843 ms</td><td class="num">3.139×</td><td class="num">31.9%</td><td class="num fail">68.1 pp</td></tr>
+            </tbody>
+          </table>
+          <p class="muted small">距 90% 验收线仍差 46.6 / 51.9 / 58.1 pp；CP 越大，相对 A800 的差距越宽。</p>
         </article>
         <article class="card">
-          <h3>Backward · CP4 → CP8</h3>
+          <h3>Backward · 绝对效率差距</h3>
+          <table>
+            <thead><tr><th>CP</th><th class="num">延迟差</th><th class="num">910B/A800</th><th class="num">保留率</th><th class="num">效率损失</th></tr></thead>
+            <tbody>
+              <tr><td>2</td><td class="num">+1.432 ms</td><td class="num">2.664×</td><td class="num">37.5%</td><td class="num fail">62.5 pp</td></tr>
+              <tr><td>4</td><td class="num">+0.918 ms</td><td class="num">2.645×</td><td class="num">37.8%</td><td class="num fail">62.2 pp</td></tr>
+              <tr><td>8</td><td class="num">+0.636 ms</td><td class="num">2.531×</td><td class="num">39.5%</td><td class="num fail">60.5 pp</td></tr>
+            </tbody>
+          </table>
+          <p class="muted small">距 90% 验收线仍差 52.5 / 52.2 / 50.5 pp；扩展良好但绝对吞吐仍低。</p>
+        </article>
+      </div>
+      <div class="grid-2" style="margin-top:14px">
+        <article class="card">
+          <h3>逐段强扩展效率</h3>
+          <table>
+            <thead><tr><th>区间</th><th class="num">A800 Fwd</th><th class="num">910B Fwd</th><th class="num">差距</th><th class="num">A800 Bwd</th><th class="num">910B Bwd</th><th class="num">差距</th></tr></thead>
+            <tbody>
+              <tr><td>CP2→4</td><td class="num">≈76.3%</td><td class="num">≈67.1%</td><td class="num warn">≈-9.2 pp</td><td class="num">≈77.0%</td><td class="num">≈77.6%</td><td class="num pass">≈+0.6 pp</td></tr>
+              <tr><td>CP4→8</td><td class="num">65.9%</td><td class="num">55.1%</td><td class="num warn">-10.8 pp</td><td class="num">67.2%</td><td class="num">70.2%</td><td class="num pass">+3.0 pp</td></tr>
+            </tbody>
+          </table>
+          <p class="muted small">CP2→4 由展示 median 近似推导；CP4→8 使用未截断样本的冻结统计。</p>
+        </article>
+        <article class="card">
+          <h3>CP2 → CP8 总体扩展</h3>
           <div class="efficiency-cards">
-            <div class="eff-card"><span class="muted small">A800</span><div class="big" style="color:var(--a800)">67.2%</div><span class="small muted">reference</span></div>
-            <div class="eff-card"><span class="muted small">910B</span><div class="big pass">70.2%</div><span class="small muted">+3.0 pp · pass</span></div>
+            <div class="eff-card"><span class="muted small">Forward · A800 / 910B</span><div class="big warn">2.01× / 1.48×</div><span class="small muted">理想 4× 效率：50.3% / 36.9%</span></div>
+            <div class="eff-card"><span class="muted small">Backward · A800 / 910B</span><div class="big pass">2.07× / 2.18×</div><span class="small muted">理想 4× 效率：51.7% / 54.5%</span></div>
           </div>
+          <p class="muted small">Forward ratio 2.306×→3.139×；Backward ratio 2.664×→2.531×。</p>
+        </article>
+      </div>
+      <div class="grid-2" style="margin-top:14px">
+        <article class="card">
+          <h3>CP8 距 A800+10% 还需闭合</h3>
+          <table>
+            <thead><tr><th>指标</th><th class="num">Forward</th><th class="num">Backward</th></tr></thead>
+            <tbody>
+              <tr><td>当前 910B</td><td class="num">1.237 ms</td><td class="num">1.052 ms</td></tr>
+              <tr><td>A800+10% 预算</td><td class="num">0.433 ms</td><td class="num">0.457 ms</td></tr>
+              <tr><td>仍需减少</td><td class="num fail">0.804 ms / 65.0%</td><td class="num fail">0.595 ms / 56.6%</td></tr>
+              <tr><td>Local / 总预算</td><td class="num">1.96×</td><td class="num">1.62×</td></tr>
+              <tr><td>Comm+merge / 总预算</td><td class="num">1.11×</td><td class="num">1.08×</td></tr>
+            </tbody>
+          </table>
+          <p class="muted small">Component median 不可相加；但两侧各自都超过总预算，说明只优化单侧无法达标。</p>
+        </article>
+        <article class="card checks">
+          <h3>差距成因判断</h3>
+          <div class="check"><span>Forward local absolute latency</span><b class="fail">主差距</b></div>
+          <div class="check"><span>Forward fixed HCCL / merge 占比</span><b class="fail">随 CP 放大</b></div>
+          <div class="check"><span>Forward scaling vs A800</span><b class="warn">两段均落后</b></div>
+          <div class="check"><span>Backward scaling vs A800</span><b class="pass">两段均不弱</b></div>
+          <div class="check"><span>Backward 剩余问题</span><b class="warn">绝对 local latency</b></div>
+          <div class="check"><span>单侧优化能否闭合 CP8</span><b class="fail">不能</b></div>
         </article>
       </div>
     </section>
