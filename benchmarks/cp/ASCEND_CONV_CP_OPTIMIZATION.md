@@ -56,4 +56,32 @@ Rejected candidates included per-lane flat div/mod (`129.724 ms`), 1024-channel 
 
 Strict independent shifted-tensor references cover BF16/FP16, W=2/3/4, target and tail shapes, bias, SiLU, residual, and initial state. Five single-NPU tests, including NaN-poisoned output, pass. The frozen CP2 BF16 full forward/backward smoke also passes.
 
-Stage 2 commit: recorded by the next stage after commit creation.
+Stage 2 commit: `7b72944ce7ba6c8450418f25b13beda10fbc5ba6`.
+
+## Stage 3 — dense backward pipeline
+
+The retained dense backward path separates activation-gradient recomputation, `dx`, parameter reduction, and `dh0`. The `dpre`, `dx`, and boundary-only `dh0` kernels use the same grid-safe `64x128` task mapping as forward, FP32 accumulation, explicit round-to-nearest-even output casts, int64 address arithmetic, and `multibuffer=False`. The high-precision path retains FP32 `dpre`.
+
+The initial two-level Triton `dw/db` implementation eliminated the original `O(NT*D*W)` workspace but remained program-bound. The best correct Triton version used 16 deterministic T splits and `BT=64,BD=8`; it measured `61.196 ms` for full forward/backward. A one-tap `BT=64,BD=64` version required `8470528` UB bits, while reducing it to `BT=8` compiled but regressed to `184.742 ms` because each tap reread `dpre` and each split executed 16 T loops.
+
+The retained parameter-gradient implementation therefore uses the CANN/PyTorch fused FP32 multiply-reduction primitives. It processes 512-token chunks so the largest FP32 product temporary is about 6 MiB, accumulates each depthwise tap deterministically in FP32, and casts only the final `dw/db`. This is materially faster on 910B than lowering the reduction through Triton 3.2.0's Vector path. A full-T version reached `5.921 ms` aggregate latency but raised peak HBM to 132.1 MiB; chunking retains most of the speed at 105.1 MiB.
+
+An additional address-clamping candidate replaced masked negative boundary addresses with 2D `tl.where` selections. Triton-Ascend materialized those selections and raised forward/dpre UB demand to about `16.8/18.9 Mbit` against the `1.57 Mbit` limit, so it was rejected; the retained masked-load form is covered by output and intermediate NaN poisoning.
+
+The final `Tlocal=2048,D=3072,W=4,BF16,SiLU` 5-warmup/30-sample result is:
+
+| Platform/path | p20 | p50 | p80 | CV | Peak HBM | Compile |
+| ------------- | --: | --: | --: | -: | -------: | ------: |
+| A800 production stack | 1.151 ms | 1.165 ms | 1.189 ms | 6.42% | 86.0 MiB | 0.500 s warm-cache |
+| 910B Stage 1 | 110.825 ms | 111.294 ms | 111.698 ms | 0.61% | 111.2 MiB | 18.934 s cold-cache |
+| 910B Stage 3 high | 6.232 ms | 6.251 ms | 6.298 ms | 0.80% | 105.1 MiB | 16.028 s cold-cache |
+
+The aggregate Stage 1-to-Stage 3 speedup is `17.80x`, and the remaining 910B/A800 full-forward/backward gap is `5.37x`. Using the separately measured retained forward median of `2.667 ms`, the derived backward median is about `3.584 ms`: `25.29x` faster than the original 910B `90.653 ms`, with a remaining `4.08x` gap to the A800 `0.879 ms` backward baseline. The values are differences of separately synchronized medians and are labeled as derived rather than direct component timing.
+
+The high path reduces total measured peak HBM by 5.5%, not the final 30% target. It completely removes the old partial `dw/db` workspace, but FP32 `dpre` and the chunk product remain live. The planned `a800` precision selector in Stage 5 will evaluate BF16 `dpre`; the 30% memory target remains open until that gate is measured rather than being claimed here.
+
+Correctness coverage now includes BF16/FP16, W=2/3/4, short `T=2<W`, a non-tile tail, the target shape, bias/activation/state present and absent, and NaN-poisoned `dpre/dx/dw/db/dh0`. The short-sequence gate found and fixed an out-of-bounds `dh0` read when `T<W-1`. All other gradients retain the strict `1e-3` RMS gate. BF16 `dh0` uses a frozen A800-relative limit of `3.1e-3`: at the target shape A800 measures `2.766e-3` and 910B `2.847e-3`, a 2.9% difference within the agreed A800 `1.10x` envelope.
+
+The CP reference is now an independent packed-sequence PyTorch FP32 implementation instead of another production kernel. The CP2 BF16 target smoke passes unchanged on both HCCL/910B and NCCL/A800.
+
+Stage 3 commit: recorded after commit creation.

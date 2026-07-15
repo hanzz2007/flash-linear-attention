@@ -63,45 +63,73 @@ from fla.ops.cp import build_cp_context
 from fla.utils import IS_NPU, device, device_torch_lib
 
 # Configure logging to see assert_close messages
-logging.basicConfig(level=logging.INFO, format='%(message)s')
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
 def assert_strict_close(name: str, reference: torch.Tensor, actual: torch.Tensor, ratio: float = 1e-3) -> None:
     """Assert finite relative-RMS agreement without CI warning downgrade."""
-    assert torch.isfinite(reference).all().item(), f'{name}: non-finite reference'
-    assert torch.isfinite(actual).all().item(), f'{name}: non-finite result'
+    assert torch.isfinite(reference).all().item(), f"{name}: non-finite reference"
+    assert torch.isfinite(actual).all().item(), f"{name}: non-finite result"
     reference = reference.detach().float()
     actual = actual.detach().float()
     max_abs = (reference - actual).abs().max().item()
     rms = (reference - actual).square().mean().sqrt()
     base = reference.square().mean().sqrt()
     error_ratio = (rms / (base + 1e-8)).item()
-    assert max_abs <= 1e-6 or error_ratio < ratio, (
-        f'{name}: max_abs={max_abs:.6g}, ratio={error_ratio:.6g}, limit={ratio:.6g}'
-    )
+    assert max_abs <= 1e-6 or error_ratio < ratio, f"{name}: max_abs={max_abs:.6g}, ratio={error_ratio:.6g}, limit={ratio:.6g}"
+
+
+def causal_conv1d_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: str | None,
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Independent FP32 causal depthwise convolution for packed sequences."""
+    _, _, D = x.shape
+    W = weight.shape[1]
+    boundaries = cu_seqlens.detach().cpu().tolist()
+    outputs = []
+    for bos, eos in zip(boundaries[:-1], boundaries[1:]):
+        sequence = x[:, bos:eos].float()
+        length = eos - bos
+        output = torch.zeros(1, length, D, dtype=torch.float32, device=x.device)
+        for tap in range(W):
+            shift = W - 1 - tap
+            source = (
+                sequence if shift == 0 else torch.cat((torch.zeros_like(sequence[:, :shift]), sequence), dim=1)[:, :length]
+            )
+            output = output + source * weight[:, tap].float()[None, None, :]
+        if bias is not None:
+            output = output + bias.float()[None, None, :]
+        if activation in ("silu", "swish"):
+            output = output * torch.sigmoid(output)
+        outputs.append(output)
+    return torch.cat(outputs, dim=1).to(x.dtype)
 
 
 def init_distributed(rank, world_size, port):
     """Initialize distributed environment for a single process."""
     # Configure logging in worker process
-    logging.basicConfig(level=logging.INFO, format='%(message)s')
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = str(port)
-    os.environ['RANK'] = str(rank)
-    os.environ['WORLD_SIZE'] = str(world_size)
-    os.environ['LOCAL_RANK'] = str(rank)
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
 
-    visible_var = 'ASCEND_RT_VISIBLE_DEVICES' if IS_NPU else 'CUDA_VISIBLE_DEVICES'
-    visible_devices = os.environ.get(visible_var, '').split(',')
+    visible_var = "ASCEND_RT_VISIBLE_DEVICES" if IS_NPU else "CUDA_VISIBLE_DEVICES"
+    visible_devices = os.environ.get(visible_var, "").split(",")
     device_key = visible_devices[rank].strip() if len(visible_devices) > rank else str(rank)
-    os.environ['TRITON_CACHE_DIR'] = f'/tmp/fla-triton-cache-{device}-{device_key}'
+    os.environ["TRITON_CACHE_DIR"] = f"/tmp/fla-triton-cache-{device}-{device_key}"
     if IS_NPU:
-        os.environ.setdefault('HCCL_NPU_SOCKET_PORT_RANGE', 'auto')
-        os.environ.setdefault('HCCL_CONNECT_TIMEOUT', '600')
+        os.environ.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "auto")
+        os.environ.setdefault("HCCL_CONNECT_TIMEOUT", "600")
     device_torch_lib.set_device(rank)
     dist.init_process_group(
-        backend='hccl' if IS_NPU else 'nccl',
+        backend="hccl" if IS_NPU else "nccl",
         rank=rank,
         world_size=world_size,
         timeout=timedelta(minutes=20),
@@ -137,11 +165,11 @@ def run_cp_conv_test_worker(
         assert sum(lengths) == T, f"Sum of lengths {sum(lengths)} must equal T={T}"
 
         if rank == 0:
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"Test: {test_name}")
             print(f"Config: T={T}, D={D}, W={W}, world_size={world_size}")
             print(f"Sequence lengths: {lengths}")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
 
         # Step 1: Prepare Global Data
         torch.manual_seed(42)
@@ -159,7 +187,7 @@ def run_cp_conv_test_worker(
         cu_seqlens_list = [0] + torch.cumsum(torch.tensor(lengths), 0).tolist()
         cu_seqlens_global = torch.tensor(cu_seqlens_list, device=worker_device, dtype=torch.int32)
 
-        activation = 'swish'
+        activation = "swish"
 
         # Step 2: Reference Run
         # Run the same reference on every device to avoid cold-cache skew before
@@ -168,14 +196,7 @@ def run_cp_conv_test_worker(
         weight_ref = weight.clone().detach().requires_grad_(True)
         bias_ref = bias.clone().detach().requires_grad_(True)
 
-        y_ref, _ = causal_conv1d(
-            x=x_ref,
-            weight=weight_ref,
-            bias=bias_ref,
-            activation=activation,
-            backend='triton',
-            cu_seqlens=cu_seqlens_global,
-        )
+        y_ref = causal_conv1d_reference(x_ref, weight_ref, bias_ref, activation, cu_seqlens_global)
         y_ref.backward(dy_global)
 
         ref_out = y_ref.detach()
@@ -197,10 +218,12 @@ def run_cp_conv_test_worker(
         weight_local = weight.clone().detach().requires_grad_(True)
         bias_local = bias.clone().detach().requires_grad_(True)
 
-        print(f"[Rank {rank}] chunk: [{start_idx}, {end_idx}), "
-              f"cu_seqlens: {context.cu_seqlens.tolist()}, "
-              f"pre_num_ranks: {context.pre_num_ranks}, "
-              f"pre_num_conv_tokens: {context.pre_num_conv_tokens}")
+        print(
+            f"[Rank {rank}] chunk: [{start_idx}, {end_idx}), "
+            f"cu_seqlens: {context.cu_seqlens.tolist()}, "
+            f"pre_num_ranks: {context.pre_num_ranks}, "
+            f"pre_num_conv_tokens: {context.pre_num_conv_tokens}"
+        )
         dist.barrier()
 
         # CP Forward
@@ -233,14 +256,14 @@ def run_cp_conv_test_worker(
         if rank == 0:
             print(f"\n[{test_name}] Verification Results:")
             try:
-                assert_strict_close('Output', ref_out, y_cp_global)
-                assert_strict_close('dx', ref_dx, dx_cp_global)
+                assert_strict_close("Output", ref_out, y_cp_global)
+                assert_strict_close("dx", ref_dx, dx_cp_global)
                 # Each rank's parameter gradient is cast to the BF16 weight
                 # dtype before CP reduction. The frozen A800 target-shape RMS
                 # ratio is 2.978e-3, so retain its 1.10x numerical envelope.
                 parameter_ratio = 3.3e-3 if dtype == torch.bfloat16 else 1e-3
-                assert_strict_close('dw', ref_dw, dw_cp, ratio=parameter_ratio)
-                assert_strict_close('db', ref_db, db_cp, ratio=parameter_ratio)
+                assert_strict_close("dw", ref_dw, dw_cp, ratio=parameter_ratio)
+                assert_strict_close("db", ref_db, db_cp, ratio=parameter_ratio)
                 print(f"✅ [{test_name}] Test Passed!\n")
             except AssertionError as e:
                 print(f"❌ [{test_name}] Test Failed: {e}\n")
@@ -272,20 +295,21 @@ def run_cp_test_with_spawn(
     """
     # Use start_processes with spawn to avoid fork/spawn conflicts
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(('127.0.0.1', 0))
+        sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     mp.start_processes(
         run_cp_conv_test_worker,
         args=(world_size, test_name, T, D, W, lengths, dtype, port),
         nprocs=world_size,
         join=True,
-        start_method='spawn',
+        start_method="spawn",
     )
 
 
 # ============================================================
 # Test Scenario Definitions
 # ============================================================
+
 
 def test_cp2_sequence_cut():
     """
@@ -417,6 +441,7 @@ def test_cp2_many_short_sequences():
 # missing the `& (o_t < T)` bound check, causing out-of-bounds
 # reads from dy and producing NaN in dw.
 # ============================================================
+
 
 @pytest.mark.parametrize("backend", ["triton"])
 def test_cp2_short_tail_len1(backend):
@@ -592,11 +617,11 @@ def test_cp4_worst_case_many_len1(backend):
 def test_cp2_bfloat16_target_smoke():
     """CP2 BF16 smoke for the production W=4, D=1024 path."""
     if device_torch_lib.device_count() < 2:
-        pytest.skip('At least 2 accelerators required')
+        pytest.skip("At least 2 accelerators required")
 
     run_cp_test_with_spawn(
         world_size=2,
-        test_name='CP2_BF16_TargetSmoke',
+        test_name="CP2_BF16_TargetSmoke",
         T=512,
         D=1024,
         W=4,
@@ -605,16 +630,16 @@ def test_cp2_bfloat16_target_smoke():
     )
 
 
-@pytest.mark.skipif(not IS_NPU, reason='Ascend CP8 production-shape coverage')
-@pytest.mark.parametrize('D', [1024, 3072])
+@pytest.mark.skipif(not IS_NPU, reason="Ascend CP8 production-shape coverage")
+@pytest.mark.parametrize("D", [1024, 3072])
 def test_cp8_ascend_target(D):
     """CP8 BF16 target with Tglobal=16384 and Tlocal=2048."""
     if device_torch_lib.device_count() < 8:
-        pytest.skip('At least 8 accelerators required')
+        pytest.skip("At least 8 accelerators required")
 
     run_cp_test_with_spawn(
         world_size=8,
-        test_name=f'CP8_Ascend_Target_D{D}',
+        test_name=f"CP8_Ascend_Target_D{D}",
         T=16384,
         D=D,
         W=4,
@@ -627,14 +652,15 @@ def test_cp8_ascend_target(D):
 # Main Entry Point (for torchrun)
 # ============================================================
 
+
 def setup_distributed_torchrun():
     """Initialize distributed environment for torchrun."""
-    if 'RANK' not in os.environ:
+    if "RANK" not in os.environ:
         return False
 
     if IS_NPU:
-        os.environ.setdefault('HCCL_NPU_SOCKET_PORT_RANGE', 'auto')
-    dist.init_process_group(backend='hccl' if IS_NPU else 'nccl')
+        os.environ.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "auto")
+    dist.init_process_group(backend="hccl" if IS_NPU else "nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     device_torch_lib.set_device(local_rank)
     return True
