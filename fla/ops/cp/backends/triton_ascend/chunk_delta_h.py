@@ -80,6 +80,15 @@ def _matrix_tile_size(K: int) -> int:
     return 128 if K <= 128 else 16
 
 
+def _validate_cp_dimensions(*, H: int, HV: int, K: int, V: int) -> None:
+    if min(H, HV, K, V) <= 0:
+        raise ValueError(f"CP head counts and dimensions must be positive, got H={H}, HV={HV}, K={K}, V={V}")
+    if HV % H != 0:
+        raise ValueError(f"CP requires HV to be divisible by H, got H={H}, HV={HV}")
+    if K > 256:
+        raise AssertionError("current kernel does not support head dimension larger than 256.")
+
+
 def _launch_flat(kernel, total_tasks: int, **kwargs) -> None:
     for task_offset, task_count in iter_axis_launch_chunks(
         total_tasks,
@@ -1220,13 +1229,13 @@ def chunk_gated_delta_rule_fwd_h_pre_process_npu(
     if not (is_gdn or is_kda or is_dplr):
         raise ValueError('Unsupported Ascend CP gate combination.')
     assert initial_state is None, 'When enable CP, the provided initial_state must be None.'
+    B, T, H, K, V, HV = *k.shape, u.shape[-1], u.shape[2]
+    del B
+    _validate_cp_dimensions(H=H, HV=HV, K=K, V=V)
     if not dist.is_initialized():
         raise RuntimeError('CP requires an initialized process group')
 
     rank = dist.get_rank(group=context.group)
-    B, T, H, K, V, HV = *k.shape, u.shape[-1], u.shape[2]
-    del B
-    assert K <= 256, 'current kernel does not support head dimension larger than 256.'
     N = 1 if cu_seqlens is None else len(cu_seqlens) - 1
     if context.is_last_rank:
         hm = k.new_zeros(HV, K, V + K, dtype=torch.float32)
@@ -1366,13 +1375,13 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
         raise ValueError('Unsupported Ascend CP gate combination.')
     precision_mode = _gdn_precision_mode() if is_gdn else 'high'
     assert dht is None, 'When enable CP, the provided dht must be None.'
+    B, T, H, K, V, HV = *q.shape, do.shape[-1], do.shape[2]
+    del B
+    _validate_cp_dimensions(H=H, HV=HV, K=K, V=V)
     if not dist.is_initialized():
         raise RuntimeError('CP requires an initialized process group')
 
     rank = dist.get_rank(group=context.group)
-    B, T, H, K, V, HV = *q.shape, do.shape[-1], do.shape[2]
-    del B
-    assert K <= 256, 'current kernel does not support head dimension being larger than 256.'
     N = 1 if cu_seqlens is None else len(cu_seqlens) - 1
     if context.is_first_rank:
         dhm = q.new_zeros(HV, K, V + K, dtype=torch.float32)

@@ -21,7 +21,8 @@ Every numerical check also requires finite reference and actual tensors. Tests u
 
 | Phase | Scope | Environment | Result | Commit |
 | --- | --- | --- | --- | --- |
-| 1 | CP context validation, exact rank metadata, int32/int64 global inputs, copy semantics, coverage tags | 910B physical device 2; CP2 on devices 2–3; CANN 9.0.0, PyTorch 2.7.1, torch-npu 2.7.1.post6, Triton-Ascend 3.2.0 | 29 protocol tests and the existing CP2 Conv sequence-cut public test passed | Backfilled in the final phase |
+| 1 | CP context validation, exact rank metadata, int32/int64 global inputs, copy semantics, coverage tags | 910B physical device 2; CP2 on devices 2–3; CANN 9.0.0, PyTorch 2.7.1, torch-npu 2.7.1.post6, Triton-Ascend 3.2.0 | 29 protocol tests and the existing CP2 Conv sequence-cut public test passed | `2f5d65c6` |
+| 2 | GDN primitive dimensions, GVA, non-power-of-two/tail tiles, K=1/193/256, precomputed gates, high/A800 precision, merge ordering, canaries, forced grid splitting | 910B physical device 2; same stack; isolated Triton caches | 8 PR primitives, 5 merge/grid cases, 9 host gates, and the 2048-token A800 target passed. Cold-cache PR primitives took 295.53 s; warm-cache A800 target took 1.94 s. | Recorded by phase 3 |
 
 ## Reproduction
 
