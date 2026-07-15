@@ -84,4 +84,4 @@ Correctness coverage now includes BF16/FP16, W=2/3/4, short `T=2<W`, a non-tile 
 
 The CP reference is now an independent packed-sequence PyTorch FP32 implementation instead of another production kernel. The CP2 BF16 target smoke passes unchanged on both HCCL/910B and NCCL/A800.
 
-Stage 3 commit: recorded after commit creation.
+Stage 3 commit: `0cc12b6a`.
