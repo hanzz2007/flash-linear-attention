@@ -25,11 +25,9 @@ from fla.ops.cp.backends.triton_ascend.chunk_delta_h import (
     _cp_gdn_bwd_gate_factors_kernel,
     _cp_gdn_fwd_h_kernel,
     _cp_gdn_gate_factors_kernel,
-    _gdn_precision_mode,
     _launch_flat,
     _launch_gdn_transition,
     _merge_rank_chain,
-    _use_a800_transition_precision,
     _value_tile_size,
 )
 from fla.ops.cp.chunk_delta_h import chunk_gated_delta_rule_fwd_h_pre_process
@@ -50,7 +48,6 @@ class GDNPrimitiveCase:
     input_scale: float = 0.05
     gate_scale: float = 0.02
     check_states: bool = True
-    precision: str = "high"
     force_split: bool = False
     nightly: bool = False
     tags: frozenset[str] = frozenset()
@@ -126,37 +123,6 @@ GDN_PRIMITIVE_CASES = (
 def _primitive_case_param(case: GDNPrimitiveCase):
     marks = (pytest.mark.nightly,) if case.nightly else ()
     return pytest.param(case, marks=marks, id=case.name)
-
-
-def test_gdn_precision_mode_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("FLA_ASCEND_CP_GDN_PRECISION", raising=False)
-    assert _gdn_precision_mode() == "high"
-    monkeypatch.setenv("FLA_ASCEND_CP_GDN_PRECISION", "A800")
-    assert _gdn_precision_mode() == "a800"
-    assert _use_a800_transition_precision(
-        precision_mode="a800",
-        dtype=torch.bfloat16,
-        K=128,
-        V=128,
-        segment_t=2048,
-    )
-    assert not _use_a800_transition_precision(
-        precision_mode="a800",
-        dtype=torch.bfloat16,
-        K=128,
-        V=128,
-        segment_t=130,
-    )
-    assert not _use_a800_transition_precision(
-        precision_mode="a800",
-        dtype=torch.float16,
-        K=128,
-        V=128,
-        segment_t=2048,
-    )
-    monkeypatch.setenv("FLA_ASCEND_CP_GDN_PRECISION", "invalid")
-    with pytest.raises(ValueError, match="FLA_ASCEND_CP_GDN_PRECISION"):
-        _gdn_precision_mode()
 
 
 def _reference_scan(
@@ -654,7 +620,7 @@ def test_gdn_local_summaries_match_independent_reference(
             HV=HV,
             BT=chunk_size,
             PRECOMPUTED_GATE=True,
-            A800_PRECISION=case.precision == "a800",
+            A800_PRECISION=False,
         )
     ref_dh = _reference_backward_state(
         q,
@@ -701,19 +667,9 @@ def test_gdn_local_summaries_match_independent_reference(
             ("H", ref_h, hm[:, :, :V]),
             ("dH", ref_dh, dhm[:, :, :V]),
         )
-    if case.precision == "a800":
-        checked += (
-            ("gate parity H", hm[:, :, :V], precomputed_hm[:, :, :V]),
-            ("gate parity M", hm[:, :, V:], precomputed_hm[:, :, V:]),
-        )
     for name, reference, actual in checked:
         max_abs, ratio = _strict_ratio(reference, actual)
-        if case.precision == "a800" and name == "precomputed dM":
-            limit = 2.353e-2
-        elif case.precision == "a800" and not name.startswith("gate parity"):
-            limit = 3e-3
-        else:
-            limit = 1e-4
+        limit = 1e-4
         assert max_abs <= 1e-6 or ratio < limit, f"{name}: max_abs={max_abs:.6g}, ratio={ratio:.6g}, limit={limit:.6g}"
 
 
