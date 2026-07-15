@@ -13,7 +13,8 @@ Logical shape and base-pointer arithmetic use `tl.int64`. Triton block pointers 
 | Phase | Change | Correctness and compile evidence | Status |
 | --- | --- | --- | --- |
 | 1 | Add a machine-checkable specialization manifest and an NPU capability test covering values 1, 16, 17, and greater than int32 | Commit `d90b2cc9`; 910B: 6 tests passed; all four runtime values reused one in-memory cache entry and produced no additional disk artifacts after the first compile | Accepted |
-| 2 | Despecialize GDN CP and shared GDN logical shapes, counts, ranks, and split offsets; remove unused cumsum parameters | 910B: specialization manifest 43 passed; shared GDN kernel matrix 41 passed; CP preprocessing 21 passed and 2 distributed cases skipped in the single-device gate | Accepted |
+| 2 | Despecialize GDN CP and shared GDN logical shapes, counts, ranks, and split offsets; remove unused cumsum parameters | Commit `f3ae596e`; 910B: specialization manifest 43 passed; shared GDN kernel matrix 41 passed; CP preprocessing 21 passed and 2 distributed cases skipped in the single-device gate | Accepted |
+| 3 | Despecialize packed-varlen Conv1d forward/backward, elementwise, reduction, state, and incremental-update runtime values; remove unused general-kernel batch arguments | 910B: specialization manifest and capability suite 53 passed; non-nightly Conv correctness suite 29 passed, including packed varlen, noncontiguous layouts, NaN poisoning, forced grid splits, state, and update paths | Accepted |
 
 The initial Phase 2 attempt made every dynamic offset int64. It was rejected because Triton-Ascend 3.2.0 block pointers accept only int32 offsets. The accepted implementation fixes the scalar type at int32 only where a value directly enters a block-pointer offset and keeps it in `do_not_specialize`; all explicit pointer arithmetic and logical values remain int64. This preserves compile reuse without changing the block-pointer ABI.
 

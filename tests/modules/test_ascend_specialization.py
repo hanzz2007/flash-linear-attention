@@ -38,6 +38,7 @@ _GDN_KKT = "fla/ops/common/backends/triton_ascend/chunk_scaled_dot_kkt.py"
 _GDN_O = "fla/ops/common/backends/triton_ascend/chunk_o.py"
 _GDN_CUMSUM = "fla/ops/utils/backends/triton_ascend/cumsum.py"
 _GDN_SOLVE = "fla/ops/utils/backends/triton_ascend/solve_tril.py"
+_CONV = "fla/modules/backends/triton_ascend/causal_conv1d.py"
 _BLOCK_POINTER_I32 = {
     _GDN_H: frozenset({"V_OFFSET"}),
     _GDN_GATE: frozenset({"NT_OFFSET"}),
@@ -210,6 +211,67 @@ SPECIALIZATION_CONTRACTS = (
         ),
     )
     for kernel in kernels
+) + (
+    SpecializationContract(
+        path=_CONV,
+        kernel="causal_conv1d_fwd_kernel",
+        runtime=frozenset({"T", "D", "B_OFFSET", "NT_OFFSET", "D_BLOCK_OFFSET"}),
+        constexpr=frozenset({"W", "BT", "BD"}),
+    ),
+    SpecializationContract(
+        path=_CONV,
+        kernel="_silu_kernel",
+        runtime=frozenset({"ELEMENT_OFFSET", "ELEMENT_END"}),
+        constexpr=frozenset({"BLOCK"}),
+    ),
+    SpecializationContract(
+        path=_CONV,
+        kernel="_add_kernel",
+        runtime=frozenset({"ELEMENT_OFFSET", "ELEMENT_END"}),
+        constexpr=frozenset({"BLOCK"}),
+    ),
+    SpecializationContract(
+        path=_CONV,
+        kernel="_silu_bwd_kernel",
+        runtime=frozenset({"T", "D", "ELEMENT_OFFSET", "ELEMENT_END"}),
+        constexpr=frozenset({"BLOCK"}),
+    ),
+    SpecializationContract(
+        path=_CONV,
+        kernel="causal_conv1d_bwd_seq_kernel",
+        runtime=frozenset({"B", "TC", "D"}),
+        constexpr=frozenset({"W", "BLOCK"}),
+    ),
+    SpecializationContract(
+        path=_CONV,
+        kernel="causal_conv1d_bwd_kernel",
+        runtime=frozenset({"T", "D", "B_OFFSET", "NT_OFFSET", "D_BLOCK_OFFSET", "NT_TOTAL"}),
+        constexpr=frozenset({"W", "BT", "BD"}),
+    ),
+    SpecializationContract(
+        path=_CONV,
+        kernel="causal_conv1d_dw_reduce_kernel",
+        runtime=frozenset({"N", "T", "D", "D_BLOCK_OFFSET"}),
+        constexpr=frozenset({"W", "BW", "BD"}),
+    ),
+    SpecializationContract(
+        path=_CONV,
+        kernel="compute_dh0_kernel",
+        runtime=frozenset({"T", "D", "N_OFFSET", "D_BLOCK_OFFSET"}),
+        constexpr=frozenset({"W", "BD"}),
+    ),
+    SpecializationContract(
+        path=_CONV,
+        kernel="causal_conv1d_states_fwd_kernel",
+        runtime=frozenset({"T", "D", "W", "N_OFFSET", "D_BLOCK_OFFSET"}),
+        constexpr=frozenset({"BW", "BD"}),
+    ),
+    SpecializationContract(
+        path=_CONV,
+        kernel="causal_conv1d_update_kernel",
+        runtime=frozenset({"D", "N_OFFSET", "D_BLOCK_OFFSET"}),
+        constexpr=frozenset({"W", "BD"}),
+    ),
 )
 
 

@@ -567,7 +567,7 @@ def _launch_bwd_dense(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=["T", "D", "B_OFFSET", "NT_OFFSET", "D_BLOCK_OFFSET"])
 def causal_conv1d_fwd_kernel(
     x,
     y,
@@ -577,11 +577,10 @@ def causal_conv1d_fwd_kernel(
     cu_seqlens,
     initial_state,
     chunk_indices,
-    B,
-    T,
-    B_OFFSET,
-    NT_OFFSET,
-    D_BLOCK_OFFSET,
+    T: tl.int64,
+    B_OFFSET: tl.int64,
+    NT_OFFSET: tl.int64,
+    D_BLOCK_OFFSET: tl.int64,
     stride_x_n,
     stride_x_t,
     stride_x_d,
@@ -591,7 +590,7 @@ def causal_conv1d_fwd_kernel(
     stride_residual_n,
     stride_residual_t,
     stride_residual_d,
-    D: tl.constexpr,
+    D: tl.int64,
     W: tl.constexpr,
     BT: tl.constexpr,
     BW: tl.constexpr,
@@ -683,34 +682,34 @@ def causal_conv1d_fwd_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ELEMENT_OFFSET", "ELEMENT_END"])
 def _silu_kernel(
     x_ptr,
     y_ptr,
-    n_elements,
-    ELEM_OFFSET: tl.constexpr,
+    ELEMENT_OFFSET: tl.int64,
+    ELEMENT_END: tl.int64,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
-    offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64) + tl.cast(ELEM_OFFSET, tl.int64)
-    mask = offs < tl.cast(n_elements, tl.int64)
+    offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64) + ELEMENT_OFFSET
+    mask = offs < ELEMENT_END
     x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     y = x * tl.sigmoid(x)
     tl.store(y_ptr + offs, y.to(y_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ELEMENT_OFFSET", "ELEMENT_END"])
 def _add_kernel(
     a_ptr,
     b_ptr,
     out_ptr,
-    n_elements,
-    ELEM_OFFSET: tl.constexpr,
+    ELEMENT_OFFSET: tl.int64,
+    ELEMENT_END: tl.int64,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
-    offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64) + tl.cast(ELEM_OFFSET, tl.int64)
-    mask = offs < tl.cast(n_elements, tl.int64)
+    offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64) + ELEMENT_OFFSET
+    mask = offs < ELEMENT_END
     a = tl.load(a_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     b = tl.load(b_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     tl.store(out_ptr + offs, (a + b).to(out_ptr.dtype.element_ty), mask=mask)
@@ -724,8 +723,8 @@ def _launch_silu(y: torch.Tensor) -> torch.Tensor:
         _silu_kernel[(grid,)](
             y,
             out,
-            n,
-            ELEM_OFFSET=elem_off,
+            ELEMENT_OFFSET=elem_off,
+            ELEMENT_END=n,
             BLOCK=_ELEM_BLOCK,
             num_warps=STATIC_WARPS,
         )
@@ -742,15 +741,15 @@ def _launch_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             a,
             b,
             out,
-            n,
-            ELEM_OFFSET=elem_off,
+            ELEMENT_OFFSET=elem_off,
+            ELEMENT_END=n,
             BLOCK=_ELEM_BLOCK,
             num_warps=STATIC_WARPS,
         )
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T", "D", "ELEMENT_OFFSET", "ELEMENT_END"])
 def _silu_bwd_kernel(
     y_ptr,
     dy_ptr,
@@ -764,16 +763,15 @@ def _silu_bwd_kernel(
     stride_out_n,
     stride_out_t,
     stride_out_d,
-    B,
-    T,
-    D,
-    ELEM_OFFSET: tl.constexpr,
+    T: tl.int64,
+    D: tl.int64,
+    ELEMENT_OFFSET: tl.int64,
+    ELEMENT_END: tl.int64,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
-    offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64) + tl.cast(ELEM_OFFSET, tl.int64)
-    n_elements = tl.cast(B, tl.int64) * tl.cast(T, tl.int64) * tl.cast(D, tl.int64)
-    mask = offs < n_elements
+    offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64) + ELEMENT_OFFSET
+    mask = offs < ELEMENT_END
     rem = offs % D
     d = rem
     rem = (offs - d) // D
@@ -823,10 +821,10 @@ def _launch_silu_bwd(y_pre: torch.Tensor, dy: torch.Tensor, *, poison: bool = Fa
             so_n,
             so_t,
             so_d,
-            B,
             T,
             D,
-            ELEM_OFFSET=elem_off,
+            ELEMENT_OFFSET=elem_off,
+            ELEMENT_END=n,
             BLOCK=_ELEM_BLOCK,
             num_warps=STATIC_WARPS,
         )
@@ -866,7 +864,7 @@ def _use_seq_bwd(
         "HAS_BIAS": lambda args: args["db"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=["B", "TC", "D"])
 def causal_conv1d_bwd_seq_kernel(
     x,
     weight,
@@ -883,9 +881,9 @@ def causal_conv1d_bwd_seq_kernel(
     stride_dy_n,
     stride_dy_t,
     stride_dy_d,
-    B,
-    TC: tl.constexpr,
-    D: tl.constexpr,
+    B: tl.int64,
+    TC: tl.int64,
+    D: tl.int64,
     W: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
@@ -967,7 +965,9 @@ def causal_conv1d_bwd_seq_kernel(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.jit
+@triton.jit(
+    do_not_specialize=["T", "D", "B_OFFSET", "NT_OFFSET", "D_BLOCK_OFFSET", "NT_TOTAL"]
+)
 def causal_conv1d_bwd_kernel(
     x,
     weight,
@@ -979,12 +979,11 @@ def causal_conv1d_bwd_kernel(
     db,
     cu_seqlens,
     chunk_indices,
-    B,
-    T,
-    B_OFFSET,
-    NT_OFFSET,
-    D_BLOCK_OFFSET,
-    NT_TOTAL,
+    T: tl.int64,
+    B_OFFSET: tl.int64,
+    NT_OFFSET: tl.int64,
+    D_BLOCK_OFFSET: tl.int64,
+    NT_TOTAL: tl.int64,
     stride_x_n,
     stride_x_t,
     stride_x_d,
@@ -994,7 +993,7 @@ def causal_conv1d_bwd_kernel(
     stride_dy_n,
     stride_dy_t,
     stride_dy_d,
-    D: tl.constexpr,
+    D: tl.int64,
     W: tl.constexpr,
     BT: tl.constexpr,
     BW: tl.constexpr,
@@ -1124,30 +1123,30 @@ def causal_conv1d_bwd_kernel(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.jit(do_not_specialize=["N", "T"])
+@triton.jit(do_not_specialize=["N", "T", "D", "D_BLOCK_OFFSET"])
 def causal_conv1d_dw_reduce_kernel(
     x,
     dy,
     initial_state,
     cu_seqlens,
     dw,
-    N,
-    T,
-    D_BLOCK_OFFSET,
+    N: tl.int64,
+    T: tl.int64,
+    D_BLOCK_OFFSET: tl.int64,
     stride_x_n,
     stride_x_t,
     stride_x_d,
     stride_dy_n,
     stride_dy_t,
     stride_dy_d,
-    D: tl.constexpr,
+    D: tl.int64,
     W: tl.constexpr,
     BW: tl.constexpr,
     BD: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_d = tl.program_id(0) + D_BLOCK_OFFSET
+    i_d = tl.program_id(0).to(tl.int64) + D_BLOCK_OFFSET
     o_d = i_d * BD + tl.arange(0, BD)
     m_d = o_d < D
     o_w = tl.arange(0, BW)
@@ -1220,7 +1219,7 @@ def causal_conv1d_dw_reduce_kernel(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=["T", "D", "N_OFFSET", "D_BLOCK_OFFSET"])
 def compute_dh0_kernel(
     dy,
     y,
@@ -1233,10 +1232,10 @@ def compute_dh0_kernel(
     stride_y_n,
     stride_y_t,
     stride_y_d,
-    T,
-    N_OFFSET,
-    D_BLOCK_OFFSET,
-    D: tl.constexpr,
+    T: tl.int64,
+    N_OFFSET: tl.int64,
+    D_BLOCK_OFFSET: tl.int64,
+    D: tl.int64,
     W: tl.constexpr,
     BD: tl.constexpr,
     USE_ACTIVATION: tl.constexpr,
@@ -1303,20 +1302,20 @@ def compute_dh0_kernel(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=["T", "D", "W", "N_OFFSET", "D_BLOCK_OFFSET"])
 def causal_conv1d_states_fwd_kernel(
     x,
     initial_state,
     final_state,
     cu_seqlens,
-    T,
-    D,
-    W,
+    T: tl.int64,
+    D: tl.int64,
+    W: tl.int64,
     stride_x_n,
     stride_x_t,
     stride_x_d,
-    N_OFFSET,
-    D_BLOCK_OFFSET,
+    N_OFFSET: tl.int64,
+    D_BLOCK_OFFSET: tl.int64,
     BD: tl.constexpr,
     BW: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
@@ -1371,7 +1370,7 @@ def causal_conv1d_states_fwd_kernel(
         "HAS_BIAS": lambda args: args["bias"] is not None,
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=["D", "N_OFFSET", "D_BLOCK_OFFSET"])
 def causal_conv1d_update_kernel(
     x,
     cache,
@@ -1382,9 +1381,9 @@ def causal_conv1d_update_kernel(
     stride_x_d,
     stride_y_n,
     stride_y_d,
-    N_OFFSET,
-    D_BLOCK_OFFSET,
-    D: tl.constexpr,
+    N_OFFSET: tl.int64,
+    D_BLOCK_OFFSET: tl.int64,
+    D: tl.int64,
     W: tl.constexpr,
     BD: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
@@ -1484,7 +1483,6 @@ def _launch_fwd_core(
         residual=residual,
         cu_seqlens=cu_seqlens,
         initial_state=initial_state,
-        B=B,
         T=T,
         D=D,
         W=W,
@@ -1750,7 +1748,6 @@ def causal_conv1d_bwd_npu(
             dy=dy_conv,
             dx=dx,
             cu_seqlens=cu_seqlens,
-            B=B,
             T=T,
             D=D,
             W=W,
