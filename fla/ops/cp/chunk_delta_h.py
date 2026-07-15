@@ -14,6 +14,7 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
+from fla.ops.backends import dispatch
 from fla.ops.cp.comm import all_gather_into_tensor
 from fla.ops.utils.op import exp2
 from fla.utils import autotune_cache_kwargs, check_shared_mem
@@ -730,6 +731,7 @@ def pre_process_bwd_kernel_merged(
         tl.store(p_m, b_m.to(p_m.dtype.element_ty), boundary_check=(0, 1))
 
 
+@dispatch('cp')
 def chunk_gated_delta_rule_fwd_h_pre_process(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -742,8 +744,8 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
     state_v_first: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     initial_state: torch.Tensor | None = None,
-    context: FLACPContext = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    context: FLACPContext | None = None,
+) -> torch.Tensor | None:
     if context is None or context.group is None:
         return initial_state
     assert initial_state is None, "When enable CP, the provided initial_state must be None."
@@ -814,6 +816,7 @@ def chunk_gated_delta_rule_fwd_h_pre_process(
     return initial_state
 
 
+@dispatch('cp')
 def chunk_gated_delta_rule_bwd_dhu_pre_process(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -830,7 +833,7 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
     initial_state: torch.Tensor | None = None,
     context: FLACPContext | None = None,
     chunk_size: int = 64,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     if context is None or context.group is None:
         return dht, initial_state
     assert dht is None, "When enable CP, the provided dht must be None."

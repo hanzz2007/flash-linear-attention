@@ -52,6 +52,12 @@ log_cli_level = "INFO"
 pythonpath = [
   "."
 ]
+markers = [
+  "ascend_npu: requires a single Ascend NPU",
+  "cp_distributed: starts an internal multi-process CP job and must run without xdist",
+  "cp8: requires exclusive access to eight accelerator devices",
+  "nightly: exhaustive boundary, stress, or soak coverage",
+]
 
 [tool.ruff]
 target-version = "py310"
