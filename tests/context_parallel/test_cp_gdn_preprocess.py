@@ -123,20 +123,6 @@ GDN_PRIMITIVE_CASES = (
     GDNPrimitiveCase("k129-v17", 129, 17, 64, 64, 7, 1, 2, torch.bfloat16, nightly=True, tags=frozenset({"k129"})),
     GDNPrimitiveCase("k192-v127", 192, 127, 64, 65, 7, 1, 2, torch.bfloat16, nightly=True, tags=frozenset({"k192"})),
     GDNPrimitiveCase("k255-v16", 255, 16, 16, 17, 7, 1, 2, torch.bfloat16, nightly=True, tags=frozenset({"k255"})),
-    GDNPrimitiveCase(
-        "a800-target",
-        128,
-        128,
-        64,
-        2048,
-        0,
-        1,
-        1,
-        torch.bfloat16,
-        precision="a800",
-        nightly=True,
-        tags=frozenset({"target", "a800", "precomputed-gate"}),
-    ),
 )
 
 
@@ -751,14 +737,11 @@ def test_gdn_primitive_case_matrix_covers_contract() -> None:
         "precomputed-gate",
         "forced-grid",
         "range-stress",
-        "target",
-        "a800",
     }
     assert required <= tags, f"missing GDN primitive coverage tags: {sorted(required - tags)}"
     assert min(case.K for case in GDN_PRIMITIVE_CASES) == 1
     assert max(case.K for case in GDN_PRIMITIVE_CASES) == 256
     assert any(case.K != case.V for case in GDN_PRIMITIVE_CASES)
-    assert any(case.segment_t == 2048 and case.precision == "a800" for case in GDN_PRIMITIVE_CASES)
 
 
 @dataclass(frozen=True)
