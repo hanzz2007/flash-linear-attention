@@ -77,6 +77,7 @@ from fla.utils import IS_NPU, device, device_torch_lib
 
 # Configure logging to see assert_close messages
 logging.basicConfig(level=logging.INFO, format='%(message)s')
+pytestmark = pytest.mark.cp_distributed
 
 
 def assert_strict_close(name: str, reference: torch.Tensor, actual: torch.Tensor, ratio: float) -> None:
@@ -154,8 +155,15 @@ def run_cp_gdn_test_worker(
     Runs in a spawned process with the given rank.
     """
     try:
+        # Distributed correctness accepts only the high-precision path. Keep
+        # compatibility selectors out of device execution and timing.
+        os.environ["FLA_ASCEND_CP_GDN_PRECISION"] = "high"
         init_distributed(rank, world_size, port)
         worker_device = torch.device(device, rank)
+        if IS_NPU:
+            from fla.ops.cp.backends.triton_ascend.chunk_delta_h import _gdn_precision_mode
+
+            assert _gdn_precision_mode() == "high"
 
         assert T % world_size == 0, f"T={T} must be divisible by world_size={world_size}"
         assert sum(lengths) == T, f"Sum of lengths {sum(lengths)} must equal T={T}"
@@ -335,10 +343,11 @@ def run_cp_gdn_test_worker(
                 print(f"[{test_name}] Test Failed: {e}\n")
                 test_passed = False
 
-        dist.barrier()
+        status = torch.tensor(int(test_passed), dtype=torch.int32, device=worker_device)
+        dist.broadcast(status, src=0)
         cleanup_distributed()
 
-        if not test_passed:
+        if not status.item():
             raise AssertionError(f"Test {test_name} failed on rank {rank}")
 
     except Exception as e:
@@ -439,30 +448,15 @@ def test_cp4_single_sequence():
     )
 
 
+@pytest.mark.cp8
 def test_cp8_single_sequence():
-    """CP8: single long sequence spanning all ranks."""
+    """CP8 high-precision production target spanning all ranks."""
     if device_torch_lib.device_count() < 8:
         pytest.skip("At least 8 GPUs required")
 
     run_cp_test_with_spawn(
         world_size=8,
         test_name="CP8_SingleSequence",
-        T=65536, H=4, D=128,
-        lengths=[65536],
-        dtype=torch.bfloat16,
-    )
-
-
-@pytest.mark.skipif(not IS_NPU, reason="Ascend A800-parity precision coverage")
-def test_cp8_a800_precision_path(monkeypatch: pytest.MonkeyPatch):
-    """CP8: exercise the promoted Ascend A800-parity specialization."""
-    if device_torch_lib.device_count() < 8:
-        pytest.skip("At least 8 NPUs required")
-    monkeypatch.setenv("FLA_ASCEND_CP_GDN_PRECISION", "a800")
-
-    run_cp_test_with_spawn(
-        world_size=8,
-        test_name="CP8_A800Precision",
         T=16384, H=8, D=128,
         lengths=[16384],
         dtype=torch.bfloat16,

@@ -369,6 +369,7 @@ def _forward_worker(rank: int, world_size: int, state_v_first: bool, port: int) 
         dist.destroy_process_group()
 
 
+@pytest.mark.cp_distributed
 @pytest.mark.parametrize("state_v_first", [False, True])
 def test_gdn_cp4_forward_preprocess(state_v_first: bool) -> None:
     if device_torch_lib.device_count() < 4:
@@ -1088,6 +1089,7 @@ def _non_gdn_worker(rank: int, world_size: int, mode: str, port: int) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.cp_distributed
 @pytest.mark.parametrize("mode", ["kda", "dplr"])
 def test_non_gdn_cp4_primitive(mode: str) -> None:
     if device_torch_lib.device_count() < 4:

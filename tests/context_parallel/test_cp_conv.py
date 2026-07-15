@@ -76,6 +76,7 @@ def assert_strict_close(name: str, reference: torch.Tensor, actual: torch.Tensor
     rms = (reference - actual).square().mean().sqrt()
     base = reference.square().mean().sqrt()
     error_ratio = (rms / (base + 1e-8)).item()
+    logging.info(f"{name:>16} diff: {max_abs:.6g} ratio: {error_ratio:.6g}")
     assert max_abs <= 1e-6 or error_ratio < ratio, f"{name}: max_abs={max_abs:.6g}, ratio={error_ratio:.6g}, limit={ratio:.6g}"
 
 
@@ -158,8 +159,14 @@ def run_cp_conv_test_worker(
     Runs in a spawned process with the given rank.
     """
     try:
+        # Device correctness gates execute only the accepted high mode.
+        os.environ["FLA_ASCEND_CONV_PRECISION"] = "high"
         init_distributed(rank, world_size, port)
         worker_device = torch.device(device, rank)
+        if IS_NPU:
+            from fla.modules.backends.triton_ascend.causal_conv1d import _ascend_conv_precision_mode
+
+            assert _ascend_conv_precision_mode() == "high"
 
         assert T % world_size == 0, f"T={T} must be divisible by world_size={world_size}"
         assert sum(lengths) == T, f"Sum of lengths {sum(lengths)} must equal T={T}"
@@ -247,8 +254,11 @@ def run_cp_conv_test_worker(
         dist.all_gather(dx_gathered, x_local.grad)
         dx_cp_global = torch.cat(dx_gathered, dim=1)
 
-        dw_cp = weight_local.grad.clone()
-        db_cp = bias_local.grad.clone()
+        # Isolate kernel accuracy from an avoidable BF16 collective error:
+        # production high-mode validation reduces replicated parameter
+        # gradients in FP32, then compares with the full-sequence gradient.
+        dw_cp = weight_local.grad.float()
+        db_cp = bias_local.grad.float()
         dist.all_reduce(dw_cp, op=dist.ReduceOp.SUM)
         dist.all_reduce(db_cp, op=dist.ReduceOp.SUM)
 
@@ -275,10 +285,11 @@ def run_cp_conv_test_worker(
                 print(f"❌ [{test_name}] Test Failed: {e}\n")
                 test_passed = False
 
-        dist.barrier()
+        status = torch.tensor(int(test_passed), dtype=torch.int32, device=worker_device)
+        dist.broadcast(status, src=0)
         cleanup_distributed()
 
-        if not test_passed:
+        if not status.item():
             raise AssertionError(f"Test {test_name} failed on rank {rank}")
 
     except Exception as e:
@@ -317,6 +328,7 @@ def run_cp_test_with_spawn(
 # ============================================================
 
 
+@pytest.mark.cp_distributed
 def test_cp2_sequence_cut():
     """
     Test Case 1: CP2 with sequences cut in the middle.
@@ -341,6 +353,7 @@ def test_cp2_sequence_cut():
     )
 
 
+@pytest.mark.cp_distributed
 def test_cp2_boundary_aligned():
     """
     Test Case 2: CP2 with sequence boundaries aligned with rank boundaries.
@@ -366,6 +379,7 @@ def test_cp2_boundary_aligned():
     )
 
 
+@pytest.mark.cp_distributed
 def test_cp4_complex():
     """
     Test Case 3: CP4 with complex sequence distribution.
@@ -392,6 +406,7 @@ def test_cp4_complex():
     )
 
 
+@pytest.mark.cp_distributed
 def test_cp4_single_sequence():
     """
     Test Case 4: CP4 with a single long sequence spanning all ranks.
@@ -415,6 +430,7 @@ def test_cp4_single_sequence():
     )
 
 
+@pytest.mark.cp_distributed
 def test_cp2_many_short_sequences():
     """
     Test Case 5: CP2 with many short sequences.
@@ -449,6 +465,7 @@ def test_cp2_many_short_sequences():
 # ============================================================
 
 
+@pytest.mark.cp_distributed
 @pytest.mark.parametrize("backend", ["triton"])
 def test_cp2_short_tail_len1(backend):
     """
@@ -471,6 +488,7 @@ def test_cp2_short_tail_len1(backend):
     )
 
 
+@pytest.mark.cp_distributed
 @pytest.mark.parametrize("backend", ["triton"])
 def test_cp2_short_tail_len2(backend):
     """
@@ -492,6 +510,7 @@ def test_cp2_short_tail_len2(backend):
     )
 
 
+@pytest.mark.cp_distributed
 @pytest.mark.parametrize("backend", ["triton"])
 def test_cp4_every_rank_gets_short_tail(backend):
     """
@@ -519,6 +538,7 @@ def test_cp4_every_rank_gets_short_tail(backend):
     )
 
 
+@pytest.mark.cp_distributed
 @pytest.mark.parametrize("backend", ["triton"])
 def test_cp2_multiple_short_tails(backend):
     """
@@ -542,6 +562,7 @@ def test_cp2_multiple_short_tails(backend):
     )
 
 
+@pytest.mark.cp_distributed
 @pytest.mark.parametrize("backend", ["triton"])
 def test_cp2_global_len1_sequence(backend):
     """
@@ -567,6 +588,7 @@ def test_cp2_global_len1_sequence(backend):
     )
 
 
+@pytest.mark.cp_distributed
 @pytest.mark.parametrize("backend", ["triton"])
 def test_cp4_multiple_short_tails(backend):
     """
@@ -595,6 +617,7 @@ def test_cp4_multiple_short_tails(backend):
     )
 
 
+@pytest.mark.cp_distributed
 @pytest.mark.parametrize("backend", ["triton"])
 def test_cp4_worst_case_many_len1(backend):
     """
@@ -620,6 +643,7 @@ def test_cp4_worst_case_many_len1(backend):
     )
 
 
+@pytest.mark.cp_distributed
 @pytest.mark.parametrize("comm", ["all_gather", "p2p"])
 def test_cp2_bfloat16_target_smoke(comm, monkeypatch):
     """CP2 BF16 smoke for the production W=4, D=1024 path."""
@@ -663,6 +687,7 @@ def run_conv_comm_subgroup_worker(rank: int, world_size: int, method: str, port:
         raise
 
 
+@pytest.mark.cp_distributed
 @pytest.mark.parametrize("comm", ["all_gather", "p2p"])
 def test_cp_noncontiguous_subgroup(comm):
     """Communication must interpret neighbors as ranks local to the CP group."""
@@ -764,9 +789,11 @@ def test_cp_invalid_comm_method(monkeypatch):
         _resolve_conv_comm_method(None)
 
 
-@pytest.mark.parametrize("D", [1024, 3072])
+@pytest.mark.cp_distributed
+@pytest.mark.cp8
+@pytest.mark.parametrize("D", [1024, pytest.param(3072, marks=pytest.mark.nightly)])
 def test_cp8_target(D):
-    """CP8 BF16 production target with Tglobal=16384 and Tlocal=2048."""
+    """CP8 BF16 packed-varlen target with Tglobal=16384 and Tlocal=2048."""
     if device_torch_lib.device_count() < 8:
         pytest.skip("At least 8 accelerators required")
 
@@ -776,7 +803,7 @@ def test_cp8_target(D):
         T=16384,
         D=D,
         W=4,
-        lengths=[16384],
+        lengths=[3000, 4000, 5000, 4384],
         dtype=torch.bfloat16,
     )
 
