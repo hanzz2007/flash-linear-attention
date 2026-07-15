@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ascend Triton 编译去特化优化报告</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07111f;
+      --panel: #0e1c2f;
+      --panel-2: #13253b;
+      --line: #27415e;
+      --text: #e7f0fa;
+      --muted: #97abc1;
+      --blue: #4bb3fd;
+      --cyan: #56e0d2;
+      --green: #65d18a;
+      --amber: #ffc857;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 92% 0%, rgba(75,179,253,.16), transparent 28rem),
+        radial-gradient(circle at 0% 100%, rgba(86,224,210,.10), transparent 32rem),
+        var(--bg);
+      color: var(--text);
+      font: 15px/1.6 Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { width: min(1560px, calc(100% - 48px)); margin: 0 auto; padding: 38px 0 64px; }
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1.6fr) minmax(360px, .8fr);
+      gap: 28px;
+      align-items: stretch;
+      margin-bottom: 24px;
+    }
+    h1 { margin: 8px 0 12px; font-size: clamp(34px, 4vw, 58px); line-height: 1.08; letter-spacing: -.035em; }
+    h2 { margin: 0 0 18px; font-size: 22px; }
+    h3 { margin: 0 0 8px; font-size: 16px; }
+    p { margin: 0 0 12px; }
+    .eyebrow { color: var(--cyan); font-weight: 750; letter-spacing: .14em; text-transform: uppercase; }
+    .lede { max-width: 980px; color: #bfd0e1; font-size: 18px; }
+    .panel {
+      background: linear-gradient(145deg, rgba(19,37,59,.96), rgba(11,25,43,.96));
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 24px;
+      box-shadow: 0 18px 50px rgba(0,0,0,.18);
+    }
+    .status { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 20px; }
+    .pill { border: 1px solid var(--line); border-radius: 999px; padding: 5px 11px; color: var(--muted); background: rgba(5,15,28,.5); }
+    .pill.ok { color: #b9f4cb; border-color: rgba(101,209,138,.5); }
+    .hero-metric { display: grid; place-content: center; min-height: 100%; text-align: center; }
+    .hero-metric strong { color: var(--green); font-size: 76px; line-height: 1; }
+    .hero-metric span { color: var(--muted); font-size: 16px; }
+    .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin: 16px 0 24px; }
+    .metric { padding: 20px; }
+    .metric b { display: block; color: var(--blue); font-size: 34px; line-height: 1.1; }
+    .metric small { color: var(--muted); }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin-bottom: 20px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { padding: 10px 11px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .07em; }
+    tr:last-child td { border-bottom: 0; }
+    code { color: #bde5ff; background: #071526; border-radius: 5px; padding: 2px 5px; }
+    .flow { display: grid; grid-template-columns: 1fr 44px 1fr 44px 1fr; align-items: center; gap: 7px; }
+    .node { min-height: 112px; padding: 17px; border-radius: 13px; background: #0a182a; border: 1px solid var(--line); }
+    .node strong { color: var(--cyan); display: block; margin-bottom: 5px; }
+    .arrow { color: var(--blue); text-align: center; font-size: 25px; }
+    .bars { display: grid; gap: 13px; }
+    .bar-row { display: grid; grid-template-columns: 180px 1fr 55px; gap: 12px; align-items: center; }
+    .track { height: 12px; overflow: hidden; background: #071526; border-radius: 999px; }
+    .fill { height: 100%; width: var(--w); border-radius: inherit; background: linear-gradient(90deg, var(--blue), var(--cyan)); }
+    .note { border-left: 3px solid var(--amber); padding: 13px 16px; color: #d7c89e; background: rgba(255,200,87,.06); }
+    .ok-text { color: var(--green); }
+    .muted { color: var(--muted); }
+    .commit { display: grid; grid-template-columns: 34px 110px 1fr; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+    .commit:last-child { border: 0; }
+    .commit .n { display: grid; place-content: center; width: 30px; height: 30px; border-radius: 50%; background: rgba(75,179,253,.15); color: var(--blue); }
+    footer { margin-top: 24px; color: var(--muted); text-align: center; }
+    @media (max-width: 1050px) {
+      header, .grid-2 { grid-template-columns: 1fr; }
+      .cards, .grid-3 { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 650px) {
+      main { width: min(100% - 24px, 1560px); padding-top: 20px; }
+      .cards, .grid-3 { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); }
+      .bar-row { grid-template-columns: 120px 1fr 44px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <section class="panel">
+      <div class="eyebrow">Ascend 910B · Triton 3.2.0 · CANN 9.0.0</div>
+      <h1>GDN CP 与 Conv1d<br>编译去特化优化报告</h1>
+      <p class="lede">消除动态 shape、序列位置、rank 与 grid split offset 导致的重复编译，同时保持数学、high 精度、Public API、HCCL 协议和 CUDA 路径不变。</p>
+      <div class="status">
+        <span class="pill ok">CP2 / CP4 / CP8 通过</span>
+        <span class="pill ok">High 精度</span>
+        <span class="pill">无上游 PR</span>
+        <span class="pill">性能数据未采信</span>
+      </div>
+    </section>
+    <aside class="panel hero-metric">
+      <strong>1</strong>
+      <span>4 类动态整数值共用的 JIT cache entry</span>
+      <small class="muted">1 · 16 · 17 · &gt; int32</small>
+    </aside>
+  </header>
+
+  <section class="cards">
+    <div class="panel metric"><b>55</b><small>机器检查的 kernel specialization contracts</small></div>
+    <div class="panel metric"><b>65</b><small>最终 manifest / coverage / halo 测试通过</small></div>
+    <div class="panel metric"><b>30</b><small>Conv 单 NPU 非 nightly 矩阵通过</small></div>
+    <div class="panel metric"><b>6</b><small>CP2/4/8 分布式代表用例通过</small></div>
+  </section>
+
+  <section class="grid-2">
+    <article class="panel">
+      <h2>为什么会重复编译</h2>
+      <table>
+        <thead><tr><th>普通整数值</th><th>默认分类</th><th>影响</th></tr></thead>
+        <tbody>
+          <tr><td>等于 1</td><td><code>1</code></td><td>可能作为编译期常量</td></tr>
+          <tr><td>16 字节整除</td><td><code>D</code></td><td>对齐特化变体</td></tr>
+          <tr><td>其他值</td><td><code>N</code></td><td>非对齐变体</td></tr>
+          <tr><td>推断类型变化</td><td><code>i32/i64</code></td><td>额外签名</td></tr>
+        </tbody>
+      </table>
+      <p class="note">仅移除 <code>tl.constexpr</code> 不够；高变化逻辑标量必须同时显式定型并加入 <code>do_not_specialize</code>。</p>
+    </article>
+
+    <article class="panel">
+      <h2>最终参数契约</h2>
+      <table>
+        <thead><tr><th>类别</th><th>策略</th></tr></thead>
+        <tbody>
+          <tr><td>T / D / rank / count / logical offset</td><td><code>tl.int64</code> + 完全去特化</td></tr>
+          <tr><td>block pointer offset</td><td><code>tl.int32</code> + 完全去特化</td></tr>
+          <tr><td>W / tile / mode / feature flag</td><td><code>tl.constexpr</code></td></tr>
+          <tr><td>pointer / None / dtype / stride</td><td>保留有限隐式特化</td></tr>
+        </tbody>
+      </table>
+      <p class="note">Triton-Ascend 3.2.0 的 block pointer offset 只能为 int32；base pointer 地址计算仍保持 int64。</p>
+    </article>
+  </section>
+
+  <section class="panel" style="margin-bottom:20px">
+    <h2>Dense Conv：从扁平 task 到 3D grid</h2>
+    <div class="flow">
+      <div class="node"><strong>program_id(0)</strong>channel tile<br><code>+ D_BLOCK_OFFSET</code></div>
+      <div class="arrow">→</div>
+      <div class="node"><strong>program_id(1)</strong>time tile<br><code>+ NT_OFFSET</code></div>
+      <div class="arrow">→</div>
+      <div class="node"><strong>program_id(2)</strong>batch<br><code>+ B_OFFSET</code></div>
+    </div>
+    <p class="muted" style="margin-top:14px">删除静态 NT、DB、TASK_OFFSET 与 task 除法；host 分片保证 grid product ≤ 65535。强制 max_grid=2 的前反向结果与未切分完全一致。</p>
+  </section>
+
+  <section class="grid-2">
+    <article class="panel">
+      <h2>正确性门禁</h2>
+      <div class="bars">
+        <div class="bar-row"><span>Specialization</span><div class="track"><div class="fill" style="--w:100%"></div></div><b>57</b></div>
+        <div class="bar-row"><span>共享 GDN</span><div class="track"><div class="fill" style="--w:72%"></div></div><b>41</b></div>
+        <div class="bar-row"><span>GDN preprocess</span><div class="track"><div class="fill" style="--w:37%"></div></div><b>21</b></div>
+        <div class="bar-row"><span>Conv 单 NPU</span><div class="track"><div class="fill" style="--w:53%"></div></div><b>30</b></div>
+        <div class="bar-row"><span>CP2/4/8</span><div class="track"><div class="fill" style="--w:11%"></div></div><b>6</b></div>
+      </div>
+      <p class="muted" style="margin-top:14px">各集合存在重叠；柱形用于展示门禁规模，不表示性能。</p>
+    </article>
+
+    <article class="panel">
+      <h2>CP8 high 精度结果</h2>
+      <table>
+        <thead><tr><th>目标</th><th>Output</th><th>Input grad</th><th>Parameter grad</th></tr></thead>
+        <tbody>
+          <tr><td>GDN T=16384, H=8, K=V=128</td><td class="ok-text">0</td><td>dq 0<br>dk 5e-6<br>dv 3e-6</td><td>dg 1e-5<br>db 4e-6</td></tr>
+          <tr><td>Conv packed T=16384, D=1024</td><td class="ok-text">2.29e-6</td><td>dx 8.76e-5</td><td>dW 3.70e-3<br>dB 3.58e-3</td></tr>
+        </tbody>
+      </table>
+      <p class="ok-text">全部 finite，并满足冻结 RMS ratio 门限。</p>
+    </article>
+  </section>
+
+  <section class="grid-3" style="margin-top:20px">
+    <article class="panel"><h3>GDN CP / shared</h3><p class="muted">gate factor、H/M/dH/dM、merge、WY、KKT、output、cumsum、solve 的逻辑 shape 和 split offset 去特化。</p></article>
+    <article class="panel"><h3>Packed-varlen Conv</h3><p class="muted">forward/backward、SiLU/add、dW reduction、dh0、state、incremental update 跨动态 shape 复用。</p></article>
+    <article class="panel"><h3>保留的优化边界</h3><p class="muted">dtype、pointer/None、stride、tile、W、mode/layout feature flags 仍静态化，以保护代码生成质量。</p></article>
+  </section>
+
+  <section class="grid-2" style="margin-top:20px">
+    <article class="panel">
+      <h2>效率与 A800 差距</h2>
+      <ul>
+        <li>已实测：4 种动态整数类别只产生 1 个内存 cache entry，首编译后磁盘产物数不再增长。</li>
+        <li>预期收益集中在冷启动、动态 shape 切换和 cache 占用；稳态算术与通信量不变。</li>
+        <li>CUDA/A800 文件未修改，本阶段未重新测量 A800 回退或 910B/A800 比率。</li>
+        <li>此前非可信性能数据已排除，不用作效果证明。</li>
+      </ul>
+      <p class="note">精确效率差距需用两个独立 worktree、隔离 Triton cache、相同栈元数据和 baseline↔candidate 交替顺序重新采集。</p>
+    </article>
+
+    <article class="panel">
+      <h2>阶段提交</h2>
+      <div class="commit"><span class="n">1</span><code>d90b2cc9</code><span>Specialization reuse gates</span></div>
+      <div class="commit"><span class="n">2</span><code>f3ae596e</code><span>GDN CP/shared 去特化</span></div>
+      <div class="commit"><span class="n">3</span><code>3ef2354c</code><span>Packed-varlen Conv 去特化</span></div>
+      <div class="commit"><span class="n">4</span><code>1aa26729</code><span>Dense Conv 3D grid</span></div>
+      <div class="commit"><span class="n">5</span><code>delivery</code><span>最终报告（SHA 见交付摘要）</span></div>
+    </article>
+  </section>
+
+  <footer>仅推送用户 fork · 未创建或更新官方仓库 PR</footer>
+</main>
+</body>
+</html>
