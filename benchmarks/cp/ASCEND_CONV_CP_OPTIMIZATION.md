@@ -112,4 +112,4 @@ Communication-only measurements include one forward and one backward halo exchan
 
 The initial CP8 P2P communication run had an outlier and 37.5% CV. Per the frozen timing protocol, exactly one 50-sample confirmation was run; it measured p20/p50/p80 `0.644/0.661/0.675 ms` with 4.05% CV. P2P therefore does not meet the promotion rule of at least 5% CP8 end-to-end improvement with no greater than 2% CP2/4 regression. All-gather remains the default, while P2P is retained behind the explicit switch for reproducible A/B testing. No communication-overlap candidate was merged because the synchronous P2P primitive did not first establish a benefit.
 
-Stage 4 commit: pending.
+Stage 4 commit: `1c0d674a`.
