@@ -614,20 +614,85 @@ def test_cp4_worst_case_many_len1(backend):
     )
 
 
-def test_cp2_bfloat16_target_smoke():
+@pytest.mark.parametrize("comm", ["all_gather", "p2p"])
+def test_cp2_bfloat16_target_smoke(comm, monkeypatch):
     """CP2 BF16 smoke for the production W=4, D=1024 path."""
     if device_torch_lib.device_count() < 2:
         pytest.skip("At least 2 accelerators required")
+    monkeypatch.setenv("FLA_CP_CONV_COMM", comm)
 
     run_cp_test_with_spawn(
         world_size=2,
-        test_name="CP2_BF16_TargetSmoke",
+        test_name=f"CP2_BF16_TargetSmoke_{comm}",
         T=512,
         D=1024,
         W=4,
         lengths=[512],
         dtype=torch.bfloat16,
     )
+
+
+def run_conv_comm_subgroup_worker(rank: int, world_size: int, method: str, port: int):
+    """Verify local group-peer routing for a non-contiguous subgroup."""
+    from fla.ops.cp import conv_cp_send_recv_bwd, conv_cp_send_recv_fwd
+
+    try:
+        os.environ["FLA_CP_CONV_COMM"] = method
+        init_distributed(rank, world_size, port)
+        group = dist.new_group(ranks=[0, 2])
+        if rank in (0, 2):
+            group_rank = dist.get_rank(group)
+            worker_device = torch.device(device, rank)
+            send = torch.full((3, 16), group_rank + 1, dtype=torch.float32, device=worker_device)
+            recv_fwd = conv_cp_send_recv_fwd(send, group)
+            recv_bwd = conv_cp_send_recv_bwd(send, group)
+            expected_fwd = torch.zeros_like(send) if group_rank == 0 else torch.ones_like(send)
+            expected_bwd = torch.zeros_like(send) if group_rank == 1 else torch.full_like(send, 2)
+            torch.testing.assert_close(recv_fwd, expected_fwd, rtol=0, atol=0)
+            torch.testing.assert_close(recv_bwd, expected_bwd, rtol=0, atol=0)
+        dist.barrier()
+        cleanup_distributed()
+    except Exception:
+        cleanup_distributed()
+        raise
+
+
+@pytest.mark.parametrize("comm", ["all_gather", "p2p"])
+def test_cp_noncontiguous_subgroup(comm):
+    """Communication must interpret neighbors as ranks local to the CP group."""
+    if device_torch_lib.device_count() < 4:
+        pytest.skip("At least 4 accelerators required")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    mp.start_processes(
+        run_conv_comm_subgroup_worker,
+        args=(4, comm, port),
+        nprocs=4,
+        join=True,
+        start_method="spawn",
+    )
+
+
+def test_cp_halo_left_padding():
+    """Short local chunks are right-aligned in the fixed W-1 wire shape."""
+    from fla.modules.conv.cp.ops import CausalConv1dFunctionCP
+
+    if device_torch_lib.device_count() < 1:
+        pytest.skip("At least 1 accelerator required")
+    x = torch.arange(8, dtype=torch.float32, device=device).reshape(1, 8)
+    halo = CausalConv1dFunctionCP._right_aligned_halo(x, 3)
+    expected = torch.cat((torch.zeros(2, 8, device=x.device), x), dim=0)
+    torch.testing.assert_close(halo, expected, rtol=0, atol=0)
+
+
+def test_cp_invalid_comm_method(monkeypatch):
+    """Invalid communication selectors fail before entering a collective."""
+    from fla.ops.cp.comm import _resolve_conv_comm_method
+
+    monkeypatch.setenv("FLA_CP_CONV_COMM", "invalid")
+    with pytest.raises(ValueError, match="FLA_CP_CONV_COMM"):
+        _resolve_conv_comm_method(None)
 
 
 @pytest.mark.skipif(not IS_NPU, reason="Ascend CP8 production-shape coverage")

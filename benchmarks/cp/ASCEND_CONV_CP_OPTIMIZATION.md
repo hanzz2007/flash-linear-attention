@@ -85,3 +85,31 @@ Correctness coverage now includes BF16/FP16, W=2/3/4, short `T=2<W`, a non-tile 
 The CP reference is now an independent packed-sequence PyTorch FP32 implementation instead of another production kernel. The CP2 BF16 target smoke passes unchanged on both HCCL/910B and NCCL/A800.
 
 Stage 3 commit: `0cc12b6a`.
+
+## Stage 4 — fixed halo and communication A/B
+
+The CP wire tensor is now always `[W-1,D]`. Local chunks shorter than the halo are right-aligned and zero-padded on the left, and backward adds the received gradient to only the valid local tail. This fixes both forward construction and backward accumulation when `Tlocal<W-1`. The default all-gather route remains API-compatible.
+
+An opt-in `FLA_CP_CONV_COMM=p2p` route uses `batch_isend_irecv` and process-group-local peers, so non-contiguous CP subgroups do not confuse global and group ranks. Send buffers are made contiguous before entering NCCL/HCCL. Invalid selector values fail before a collective. HCCL/910B gates pass CP2 BF16 with both methods and a CP4 complex packed-sequence case; NCCL/A800 gates pass both CP2 methods. Both platforms also pass forward/backward exchange on the non-contiguous global-rank subgroup `[0,2]`.
+
+Candidate end-to-end `Tglobal=16384,D=3072,W=4,BF16,SiLU` results use three warmups and ten samples:
+
+| CP | All-gather p50 | P2P p50 | P2P change | All-gather CV | P2P CV |
+| --: | -------------: | -------: | ---------: | ------------: | -------: |
+| 2 | 24.219 ms | 23.215 ms | 4.15% faster | 2.77% | 0.17% |
+| 4 | 12.311 ms | 12.215 ms | 0.78% faster | 0.78% | 0.50% |
+| 8 | 6.687 ms | 6.761 ms | 1.12% slower | 1.32% | 3.89% |
+
+At fixed global tokens, the corresponding CP2-to-CP8 strong-scaling efficiencies are 90.5% for all-gather and 85.8% for P2P. These are candidate-stage measurements; Stage 5 performs the final five-warmup/30-sample comparison.
+
+Communication-only measurements include one forward and one backward halo exchange:
+
+| CP | All-gather p50 | P2P p50 | All-gather peak | P2P peak |
+| --: | -------------: | -------: | --------------: | -------: |
+| 2 | 0.443 ms | 0.533 ms | 112 KiB | 94 KiB |
+| 4 | 0.476 ms | 0.631 ms | 148 KiB | 94 KiB |
+| 8 | 0.564 ms | 0.661 ms | 220 KiB | 94 KiB |
+
+The initial CP8 P2P communication run had an outlier and 37.5% CV. Per the frozen timing protocol, exactly one 50-sample confirmation was run; it measured p20/p50/p80 `0.644/0.661/0.675 ms` with 4.05% CV. P2P therefore does not meet the promotion rule of at least 5% CP8 end-to-end improvement with no greater than 2% CP2/4 regression. All-gather remains the default, while P2P is retained behind the explicit switch for reproducible A/B testing. No communication-overlap candidate was merged because the synchronous P2P primitive did not first establish a benefit.
+
+Stage 4 commit: pending.

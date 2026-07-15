@@ -26,6 +26,16 @@ class CausalConv1dFunctionCP(torch.autograd.Function):
     """
 
     @staticmethod
+    def _right_aligned_halo(x: torch.Tensor, halo_len: int) -> torch.Tensor:
+        """Return a fixed-size halo with short inputs padded on the left."""
+        assert x.dim() == 2, f"halo source must be [T, D], got {x.shape}"
+        halo = x.new_zeros(halo_len, x.shape[-1])
+        valid_len = min(halo_len, x.shape[0])
+        if valid_len > 0:
+            halo[-valid_len:].copy_(x[-valid_len:])
+        return halo
+
+    @staticmethod
     def _prepare_initial_state_for_cp(
         x: torch.Tensor,
         weight: torch.Tensor,
@@ -50,26 +60,19 @@ class CausalConv1dFunctionCP(torch.autograd.Function):
 
         W = weight.shape[-1]  # weight: [D, W]
         D = weight.shape[0]
-        initial_state = None
-        if not context.is_first_rank:
-            # Non-first rank needs initial_state
-            assert x.dim() == 3 and x.shape[0] == 1, f"CP requires [1, T, D], got {x.shape}"
-            x_2d = x.squeeze(0)  # [T, D]
-            tails = x_2d[-(W-1):].contiguous()  # [W-1, D]
-            heads = conv_cp_send_recv_fwd(tails, group)  # [W-1, D]
-            # Construct initial_state: [N, D, W]
-            N = len(cu_seqlens) - 1
-            initial_state = torch.zeros(N, D, W, device=x.device, dtype=x.dtype)
-            valid_len = min(W - 1, context.pre_num_conv_tokens)
-            if valid_len > 0:
-                # heads[-valid_len:]: [valid_len, D] -> [D, valid_len]
-                initial_state[0, :, -valid_len:] = heads[-valid_len:].T
-        else:
-            # First rank also needs to participate in communication (send tails)
-            x_2d = x.squeeze(0)
-            tails = x_2d[-(W-1):].contiguous()
-            _ = conv_cp_send_recv_fwd(tails, group)  # Send but don't use
+        assert x.dim() == 3 and x.shape[0] == 1, f"CP requires [1, T, D], got {x.shape}"
+        tails = CausalConv1dFunctionCP._right_aligned_halo(x.squeeze(0), W - 1)
+        heads = conv_cp_send_recv_fwd(tails, group)
+        if context.is_first_rank:
+            return None
 
+        # Non-first rank needs initial_state.
+        N = len(cu_seqlens) - 1
+        initial_state = torch.zeros(N, D, W, device=x.device, dtype=x.dtype)
+        valid_len = min(W - 1, context.pre_num_conv_tokens)
+        if valid_len > 0:
+            # heads[-valid_len:]: [valid_len, D] -> [D, valid_len]
+            initial_state[0, :, -valid_len:] = heads[-valid_len:].T
         return initial_state
 
     @staticmethod
@@ -105,17 +108,19 @@ class CausalConv1dFunctionCP(torch.autograd.Function):
             # of initial_state; gradients for the remaining (zero-padded) positions
             # must not flow back, otherwise they leak into unrelated sequences.
             valid_len = min(W - 1, pre_num_conv_tokens)
-            d_initial_state = torch.zeros(W-1, D, device=dx.device, dtype=dx.dtype)
+            d_initial_state = torch.zeros(W - 1, D, device=dx.device, dtype=dx.dtype)
             if valid_len > 0:
                 d_initial_state[-valid_len:] = dh0[0, :, -valid_len:].T
         else:
             # dh0 is None only when this is the first rank (no initial_state needed)
             assert is_first_rank, "dh0 should not be None when is_first_rank=False"
-            d_initial_state = torch.zeros(W-1, D, device=dx.device, dtype=dx.dtype)
+            d_initial_state = torch.zeros(W - 1, D, device=dx.device, dtype=dx.dtype)
         # Sync communication: send d_initial_state to previous rank, receive from next rank
         recv_d_init = conv_cp_send_recv_bwd(d_initial_state, group)  # [W-1, D]
         # Add to current rank's last W-1 tokens (these tokens are used as initial_state by next rank)
-        dx[0, -(W-1):, :].add_(recv_d_init)
+        local_tail_len = min(W - 1, dx.shape[1])
+        if local_tail_len > 0:
+            dx[0, -local_tail_len:, :].add_(recv_d_init[-local_tail_len:])
 
     @staticmethod
     def forward(
@@ -127,7 +132,7 @@ class CausalConv1dFunctionCP(torch.autograd.Function):
         chunk_indices: torch.Tensor | None,
         cp_context: FLACPContext | None,
         chunk_size: int | None,
-        backend: str = 'triton',
+        backend: str = "triton",
     ):
         # Import here to avoid circular dependency
         from fla.modules.conv.triton.ops import causal_conv1d_fwd
@@ -223,7 +228,7 @@ def causal_conv1d_cp(
     chunk_indices: torch.Tensor | None = None,
     cp_context: FLACPContext | None = None,
     chunk_size: int | None = None,
-    backend: str = 'triton',
+    backend: str = "triton",
 ):
     """
     Context Parallel version of causal_conv1d.
@@ -247,12 +252,9 @@ def causal_conv1d_cp(
 
     assert cp_context.conv1d_kernel_size is not None, "conv1d_kernel_size must be provided for causal_conv1d_cp"
     assert cp_context.cu_seqlens is not None, "cu_seqlens must be provided for causal_conv1d_cp"
-    assert backend in ['triton'], "backend must be 'triton'"
+    assert backend in ["triton"], "backend must be 'triton'"
     chunk_size = chunk_size or 64
     if chunk_indices is None:
         chunk_indices = prepare_chunk_indices(cp_context.cu_seqlens, chunk_size, cu_seqlens_cpu=cp_context.cu_seqlens_cpu)
 
-    return CausalConv1dFunctionCP.apply(
-        x, weight, bias, activation,
-        chunk_indices, cp_context, chunk_size, backend
-    )
+    return CausalConv1dFunctionCP.apply(x, weight, bias, activation, chunk_indices, cp_context, chunk_size, backend)
