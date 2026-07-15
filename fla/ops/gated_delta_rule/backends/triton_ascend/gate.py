@@ -57,21 +57,21 @@ def _get_gate_bwd_bt(T: int) -> int:
 @triton.heuristics({
     'HAS_BIAS': lambda args: args['dt_bias'] is not None,
 })
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'H_OFFSET'])
 def gdn_gate_fwd_kernel_npu(
     g,
     A_log,
     dt_bias,
     yg,
-    T,
+    T: tl.int64,
     H: tl.constexpr,
     BT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    H_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32,
+    H_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_h = tl.program_id(1) + H_OFFSET
+    i_h = tl.program_id(1).to(tl.int64) + H_OFFSET
 
     b_A = tl.load(A_log + i_h).to(tl.float32)
 
@@ -123,7 +123,7 @@ def _launch_gate_fwd(
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def gdn_gate_chunk_cumsum_scalar_kernel_npu(
     g,
     A_log,
@@ -132,18 +132,18 @@ def gdn_gate_chunk_cumsum_scalar_kernel_npu(
     scale,
     cu_seqlens,
     chunk_indices,
-    T,
+    T: tl.int64,
     H: tl.constexpr,
     BT: tl.constexpr,
     REVERSE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
@@ -218,7 +218,7 @@ def _launch_gate_chunk_cumsum(
 @triton.heuristics({
     'HAS_BIAS': lambda args: args['dt_bias'] is not None,
 })
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'H_OFFSET'])
 def gdn_gate_bwd_kernel_npu(
     g,
     A_log,
@@ -226,15 +226,15 @@ def gdn_gate_bwd_kernel_npu(
     dyg,
     dg,
     dA,
-    T,
+    T: tl.int64,
     H: tl.constexpr,
     BT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    H_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32,
+    H_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_h = tl.program_id(1) + H_OFFSET
+    i_h = tl.program_id(1).to(tl.int64) + H_OFFSET
 
     b_A = tl.load(A_log + i_h).to(tl.float32)
 

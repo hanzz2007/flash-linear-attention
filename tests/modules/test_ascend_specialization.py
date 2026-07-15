@@ -31,34 +31,185 @@ class SpecializationContract:
 
 _ROOT = Path(__file__).resolve().parents[2]
 _GDN_CP = "fla/ops/cp/backends/triton_ascend/chunk_delta_h.py"
+_GDN_H = "fla/ops/common/backends/triton_ascend/chunk_delta_h.py"
+_GDN_GATE = "fla/ops/gated_delta_rule/backends/triton_ascend/gate.py"
+_GDN_WY = "fla/ops/gated_delta_rule/backends/triton_ascend/wy_fast.py"
+_GDN_KKT = "fla/ops/common/backends/triton_ascend/chunk_scaled_dot_kkt.py"
+_GDN_O = "fla/ops/common/backends/triton_ascend/chunk_o.py"
+_GDN_CUMSUM = "fla/ops/utils/backends/triton_ascend/cumsum.py"
+_GDN_SOLVE = "fla/ops/utils/backends/triton_ascend/solve_tril.py"
+_BLOCK_POINTER_I32 = {
+    _GDN_H: frozenset({"V_OFFSET"}),
+    _GDN_GATE: frozenset({"NT_OFFSET"}),
+    _GDN_WY: frozenset({"NT_OFFSET"}),
+    _GDN_KKT: frozenset({"NT_OFFSET"}),
+    _GDN_O: frozenset({"V_OFFSET", "K_OFFSET", "NT_OFFSET"}),
+    _GDN_CUMSUM: frozenset({"NT_OFFSET"}),
+    _GDN_SOLVE: frozenset({"NT_OFFSET"}),
+}
 
 # Start with the GDN kernels that already satisfy the runtime-value contract.
 # Later optimization stages extend this manifest before changing each kernel family.
 SPECIALIZATION_CONTRACTS = (
     SpecializationContract(
         path=_GDN_CP,
+        kernel="_cp_gdn_gate_factors_kernel",
+        runtime=frozenset({"BOS", "SEGMENT_T", "NT", "TASK_OFFSET"}),
+        constexpr=frozenset({"BT"}),
+    ),
+    SpecializationContract(
+        path=_GDN_CP,
+        kernel="_cp_gdn_bwd_gate_factors_kernel",
+        runtime=frozenset({"BOS", "SEGMENT_T", "NT", "TASK_OFFSET"}),
+        constexpr=frozenset({"BT"}),
+    ),
+    SpecializationContract(
+        path=_GDN_CP,
         kernel="_cp_gdn_fwd_h_kernel",
-        runtime=frozenset({"BOS", "SEGMENT_T", "NT"}),
+        runtime=frozenset({"BOS", "SEGMENT_T", "NT", "TASK_OFFSET"}),
         constexpr=frozenset({"K", "V", "BT", "BV"}),
     ),
     SpecializationContract(
         path=_GDN_CP,
         kernel="_cp_gdn_fwd_m_kernel",
-        runtime=frozenset({"BOS", "SEGMENT_T", "NT"}),
+        runtime=frozenset({"BOS", "SEGMENT_T", "NT", "TASK_OFFSET"}),
         constexpr=frozenset({"K", "BT", "BM", "NM"}),
     ),
     SpecializationContract(
         path=_GDN_CP,
         kernel="_cp_gdn_bwd_dh_kernel",
-        runtime=frozenset({"BOS", "SEGMENT_T", "NT", "scale"}),
+        runtime=frozenset({"BOS", "SEGMENT_T", "NT", "scale", "TASK_OFFSET"}),
         constexpr=frozenset({"K", "V", "BT", "BV"}),
     ),
     SpecializationContract(
         path=_GDN_CP,
         kernel="_cp_gdn_bwd_m_kernel",
-        runtime=frozenset({"BOS", "SEGMENT_T", "NT"}),
+        runtime=frozenset({"BOS", "SEGMENT_T", "NT", "TASK_OFFSET"}),
         constexpr=frozenset({"K", "BT", "BM", "NM"}),
     ),
+    SpecializationContract(
+        path=_GDN_CP,
+        kernel="_cp_gdn_bwd_fused_128_kernel",
+        runtime=frozenset({"BOS", "SEGMENT_T", "NT", "scale", "TASK_OFFSET"}),
+        constexpr=frozenset({"BT", "PRECOMPUTED_GATE", "A800_PRECISION"}),
+    ),
+    SpecializationContract(
+        path=_GDN_CP,
+        kernel="_cp_merge_one_rank_kernel",
+        runtime=frozenset({"SOURCE_RANK", "TASK_OFFSET"}),
+        constexpr=frozenset({"K", "V", "BR", "BV"}),
+    ),
+    SpecializationContract(
+        path=_GDN_CP,
+        kernel="_cp_merge_rank_chain_kernel",
+        runtime=frozenset({"SOURCE_START", "SOURCE_STEP", "TASK_OFFSET"}),
+        constexpr=frozenset({"K", "V", "BV", "NUM_RANKS"}),
+    ),
+    SpecializationContract(
+        path=_GDN_CP,
+        kernel="_cp_transpose_state_kernel",
+        runtime=frozenset({"TASK_OFFSET"}),
+        constexpr=frozenset({"K", "V", "BK", "BV"}),
+    ),
+) + tuple(
+    SpecializationContract(
+        path=path,
+        kernel=kernel,
+        runtime=frozenset(runtime),
+        constexpr=frozenset(constexpr),
+    )
+    for path, kernels, runtime, constexpr in (
+        (
+            _GDN_H,
+            (
+                "chunk_gated_delta_rule_fwd_kernel_h_blockdim64_npu",
+                "chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64_npu",
+            ),
+            {"T", "V_OFFSET", "NH_OFFSET"},
+            {"BT", "BV"},
+        ),
+        (
+            _GDN_GATE,
+            ("gdn_gate_fwd_kernel_npu", "gdn_gate_bwd_kernel_npu"),
+            {"T", "NT_OFFSET", "H_OFFSET"},
+            {"BT"},
+        ),
+        (
+            _GDN_GATE,
+            ("gdn_gate_chunk_cumsum_scalar_kernel_npu",),
+            {"T", "NT_OFFSET", "BH_OFFSET"},
+            {"BT"},
+        ),
+        (
+            _GDN_WY,
+            (
+                "recompute_w_u_fwd_kernel_npu",
+                "prepare_wy_repr_bwd_k_npu",
+                "prepare_wy_repr_bwd_v_npu",
+                "prepare_wy_repr_bwd_da_mask_npu",
+                "prepare_wy_repr_bwd_da_dot1_npu",
+                "prepare_wy_repr_bwd_da_dot2_npu",
+                "prepare_wy_repr_bwd_da_gate_npu",
+                "prepare_wy_repr_bwd_finalize_k_npu",
+                "prepare_wy_repr_bwd_finalize_a2_npu",
+                "prepare_wy_repr_bwd_finalize_dg_npu",
+            ),
+            {"T", "NT_OFFSET", "BH_OFFSET"},
+            {"BT"},
+        ),
+        (
+            _GDN_KKT,
+            ("chunk_scaled_dot_kkt_fwd_kernel_npu",),
+            {"T", "NT_OFFSET", "BH_OFFSET"},
+            {"BT", "BK"},
+        ),
+        (
+            _GDN_O,
+            (
+                "chunk_fwd_kernel_o_inter_npu",
+                "chunk_fwd_kernel_o_fused_hv1_npu",
+                "chunk_fwd_kernel_o_intra_hv1_npu",
+                "chunk_fwd_kernel_o_intra_npu",
+            ),
+            {"T", "V_OFFSET", "NT_OFFSET", "BH_OFFSET"},
+            {"BT", "BV"},
+        ),
+        (
+            _GDN_O,
+            ("chunk_bwd_kernel_dv_local_hv1_npu", "chunk_bwd_kernel_dv_local_npu"),
+            {"T", "NT_OFFSET", "BH_OFFSET"},
+            {"BT", "BV"},
+        ),
+        (
+            _GDN_O,
+            ("chunk_bwd_kernel_dqkwg_npu", "chunk_bwd_kernel_dg_npu"),
+            {"B", "T", "K_OFFSET", "NT_OFFSET", "BH_OFFSET"},
+            {"BT", "BK"},
+        ),
+        (
+            _GDN_CUMSUM,
+            ("chunk_local_cumsum_scalar_kernel_npu", "chunk_local_cumsum_vector_kernel_npu"),
+            {"T", "NT_OFFSET", "BH_OFFSET"},
+            {"BT"},
+        ),
+        (
+            _GDN_CUMSUM,
+            ("chunk_global_cumsum_scalar_kernel_npu", "chunk_global_cumsum_vector_kernel_npu"),
+            {"T", "BH_OFFSET"},
+            {"BT"},
+        ),
+        (
+            _GDN_SOLVE,
+            (
+                "solve_tril_16x16_kernel_npu",
+                "merge_16x16_to_32x32_inverse_kernel_npu",
+                "merge_16x16_to_64x64_inverse_kernel_npu",
+            ),
+            {"T", "NT_OFFSET", "BH_OFFSET"},
+            {"BT"},
+        ),
+    )
+    for kernel in kernels
 )
 
 
@@ -90,6 +241,9 @@ def test_specialization_manifest(contract: SpecializationContract):
 
     assert contract.runtime <= actual_runtime
     assert contract.runtime.isdisjoint(contract.constexpr)
+    for name in contract.runtime - {"scale"}:
+        expected_type = "tl.int32" if name in _BLOCK_POINTER_I32.get(contract.path, ()) else "tl.int64"
+        assert annotations[name] == expected_type
     for name in contract.constexpr:
         assert annotations[name] == "tl.constexpr"
 

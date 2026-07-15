@@ -92,7 +92,7 @@ def _launch_wy_kernel(kernel, *, NT: int, bh_total: int, kernel_kwargs: dict) ->
             kernel[(nt_len, bh_len)](**kernel_kwargs)
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def recompute_w_u_fwd_kernel_npu(
     k,
     v,
@@ -103,7 +103,7 @@ def recompute_w_u_fwd_kernel_npu(
     g,
     cu_seqlens,
     chunk_indices,
-    T,
+    T: tl.int64,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -113,11 +113,11 @@ def recompute_w_u_fwd_kernel_npu(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -157,17 +157,17 @@ def recompute_w_u_fwd_kernel_npu(
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def prepare_wy_repr_bwd_k_npu(
     k, beta, g, A, dw, dk, dA_scr, db, dg,
-    cu_seqlens, chunk_indices, T,
+    cu_seqlens, chunk_indices, T: tl.int64,
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr,
     USE_G: tl.constexpr, IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32, BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -222,17 +222,17 @@ def prepare_wy_repr_bwd_k_npu(
         tl.store(p_dg, b_dg.to(p_dg.dtype.element_ty), boundary_check=(0,))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def prepare_wy_repr_bwd_v_npu(
     v, beta, A, du, dv, dA_scr, db,
-    cu_seqlens, chunk_indices, T,
+    cu_seqlens, chunk_indices, T: tl.int64,
     HV: tl.constexpr, V: tl.constexpr,
     BT: tl.constexpr, BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32, BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -268,16 +268,16 @@ def prepare_wy_repr_bwd_v_npu(
     tl.store(p_db, b_db.to(p_db.dtype.element_ty), boundary_check=(0,))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def prepare_wy_repr_bwd_da_mask_npu(
     dA_scr,
-    cu_seqlens, chunk_indices, T,
+    cu_seqlens, chunk_indices, T: tl.int64,
     HV: tl.constexpr, BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32, BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -295,16 +295,16 @@ def prepare_wy_repr_bwd_da_mask_npu(
     tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def prepare_wy_repr_bwd_da_dot1_npu(
     A, dA_scr, dA_mid,
-    cu_seqlens, chunk_indices, T,
+    cu_seqlens, chunk_indices, T: tl.int64,
     HV: tl.constexpr, BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32, BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -322,16 +322,16 @@ def prepare_wy_repr_bwd_da_dot1_npu(
     tl.store(p_out, b_out.to(p_out.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def prepare_wy_repr_bwd_da_dot2_npu(
     A, dA_mid, dA_out,
-    cu_seqlens, chunk_indices, T,
+    cu_seqlens, chunk_indices, T: tl.int64,
     HV: tl.constexpr, BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32, BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -356,16 +356,16 @@ def prepare_wy_repr_bwd_da_dot2_npu(
 _DG_BLK = 16
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def prepare_wy_repr_bwd_da_gate_npu(
     g, dA_out,
-    cu_seqlens, chunk_indices, T,
+    cu_seqlens, chunk_indices, T: tl.int64,
     HV: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32, BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -396,17 +396,17 @@ def prepare_wy_repr_bwd_da_gate_npu(
             tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def prepare_wy_repr_bwd_finalize_k_npu(
     k, beta, dA_out, dk, db,
-    cu_seqlens, chunk_indices, T,
+    cu_seqlens, chunk_indices, T: tl.int64,
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32, BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -442,17 +442,17 @@ def prepare_wy_repr_bwd_finalize_k_npu(
 _DG_ROW_BR = 16
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def prepare_wy_repr_bwd_finalize_a2_npu(
     k, beta, a2_scr,
-    cu_seqlens, chunk_indices, T,
+    cu_seqlens, chunk_indices, T: tl.int64,
     H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32, BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -475,16 +475,16 @@ def prepare_wy_repr_bwd_finalize_a2_npu(
     tl.store(p_a2, b_A2.to(p_a2.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def prepare_wy_repr_bwd_finalize_dg_npu(
     dA_out, a2_scr, dg, col_acc_scr,
-    cu_seqlens, chunk_indices, T,
+    cu_seqlens, chunk_indices, T: tl.int64,
     HV: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr, BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32, BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
     if IS_VARLEN:
         i_tg = i_t

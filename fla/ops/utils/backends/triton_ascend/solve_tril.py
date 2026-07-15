@@ -38,21 +38,21 @@ def _launch_solve_tril_kernel(kernel, *, NT: int, bh_total: int, kernel_kwargs: 
             kernel[(nt_len, bh_len)](num_warps=_NUM_WARPS, **kernel_kwargs)
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def solve_tril_16x16_kernel_npu(
     A,
     Ai,
     cu_seqlens,
     chunk_indices,
-    T,
+    T: tl.int64,
     H: tl.constexpr,
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -85,21 +85,21 @@ def solve_tril_16x16_kernel_npu(
     tl.store(p_Ai, b_A.to(p_Ai.dtype.element_ty, fp_downcast_rounding='rtne'), boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def merge_16x16_to_32x32_inverse_kernel_npu(
     A,
     Ai,
     cu_seqlens,
     chunk_indices,
-    T,
+    T: tl.int64,
     H: tl.constexpr,
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -150,21 +150,21 @@ def merge_16x16_to_32x32_inverse_kernel_npu(
     tl.store(p_Ai_21, b_Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding='rtne'), boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def merge_16x16_to_64x64_inverse_kernel_npu(
     A,
     Ai,
     cu_seqlens,
     chunk_indices,
-    T,
+    T: tl.int64,
     H: tl.constexpr,
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)

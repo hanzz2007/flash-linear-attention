@@ -62,7 +62,7 @@ def _launch_kkt_kernel(kernel, *, NT: int, bh_total: int, kernel_kwargs: dict) -
             kernel[(nt_len, bh_len)](num_warps=_NUM_WARPS, **kernel_kwargs)
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def chunk_scaled_dot_kkt_fwd_kernel_npu(
     k,
     g,
@@ -70,7 +70,7 @@ def chunk_scaled_dot_kkt_fwd_kernel_npu(
     A,
     cu_seqlens,
     chunk_indices,
-    T,
+    T: tl.int64,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -79,11 +79,11 @@ def chunk_scaled_dot_kkt_fwd_kernel_npu(
     BK: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)

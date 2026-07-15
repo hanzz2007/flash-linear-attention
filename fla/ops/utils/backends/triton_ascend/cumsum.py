@@ -108,7 +108,6 @@ def _launch_local_cumsum_scalar(
         scale=scale,
         cu_seqlens=cu_seqlens,
         T=T,
-        B=B,
         H=H,
         BT=BT,
         HEAD_FIRST=head_first,
@@ -156,7 +155,6 @@ def _launch_local_cumsum_vector(
         scale=scale,
         cu_seqlens=cu_seqlens,
         T=T,
-        B=B,
         H=H,
         S=S,
         BT=BT,
@@ -185,27 +183,25 @@ def _launch_local_cumsum_vector(
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def chunk_local_cumsum_scalar_kernel_npu(
     s,
     o,
     scale,
     cu_seqlens,
     chunk_indices,
-    T,
-    B: tl.constexpr,
+    T: tl.int64,
     H: tl.constexpr,
     BT: tl.constexpr,
     REVERSE: tl.constexpr,
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
-    i_t += NT_OFFSET
-    i_bh += BH_OFFSET
+    i_t = tl.program_id(0) + NT_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -234,15 +230,14 @@ def chunk_local_cumsum_scalar_kernel_npu(
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def chunk_local_cumsum_vector_kernel_npu(
     s,
     o,
     scale,
     cu_seqlens,
     chunk_indices,
-    T,
-    B: tl.constexpr,
+    T: tl.int64,
     H: tl.constexpr,
     S: tl.constexpr,
     BT: tl.constexpr,
@@ -251,12 +246,12 @@ def chunk_local_cumsum_vector_kernel_npu(
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
-    i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_t += NT_OFFSET
-    i_bh += BH_OFFSET
+    i_s = tl.program_id(0).to(tl.int64)
+    i_t = tl.program_id(1) + NT_OFFSET
+    i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -285,23 +280,22 @@ def chunk_local_cumsum_vector_kernel_npu(
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'BH_OFFSET'])
 def chunk_global_cumsum_scalar_kernel_npu(
     s,
     o,
     scale,
     cu_seqlens,
-    T,
-    B: tl.constexpr,
+    T: tl.int64,
     H: tl.constexpr,
     BT: tl.constexpr,
     REVERSE: tl.constexpr,
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    BH_OFFSET: tl.int64,
 ):
-    i_nh = tl.program_id(0) + BH_OFFSET
+    i_nh = tl.program_id(0).to(tl.int64) + BH_OFFSET
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
@@ -336,14 +330,13 @@ def chunk_global_cumsum_scalar_kernel_npu(
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'BH_OFFSET'])
 def chunk_global_cumsum_vector_kernel_npu(
     s,
     o,
     scale,
     cu_seqlens,
-    T,
-    B: tl.constexpr,
+    T: tl.int64,
     H: tl.constexpr,
     S: tl.constexpr,
     BT: tl.constexpr,
@@ -352,9 +345,10 @@ def chunk_global_cumsum_vector_kernel_npu(
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    BH_OFFSET: tl.int64,
 ):
-    i_s, i_nh = tl.program_id(0), tl.program_id(1) + BH_OFFSET
+    i_s = tl.program_id(0).to(tl.int64)
+    i_nh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
@@ -491,7 +485,6 @@ def chunk_global_cumsum_scalar_npu(
         scale=scale,
         cu_seqlens=cu_seqlens,
         T=T,
-        B=B,
         H=H,
         BT=BT,
         HEAD_FIRST=head_first,
@@ -535,7 +528,6 @@ def chunk_global_cumsum_vector_npu(
         scale=scale,
         cu_seqlens=cu_seqlens,
         T=T,
-        B=B,
         H=H,
         S=S,
         BT=BT,

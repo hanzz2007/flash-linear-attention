@@ -111,19 +111,19 @@ def _dot_fp32_low_rhs(lhs, rhs):
     return tl.dot(lhs_hi, rhs, allow_tf32=False) + tl.dot(lhs_lo, rhs, allow_tf32=False)
 
 
-@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T'])
+@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT', 'TASK_OFFSET'])
 def _cp_gdn_gate_factors_kernel(
     g,
     gate_rel,
     gate_decay,
-    BOS,
-    SEGMENT_T,
+    BOS: tl.int64,
+    SEGMENT_T: tl.int64,
     HV: tl.constexpr,
     BT: tl.constexpr,
-    NT: tl.constexpr,
-    TASK_OFFSET: tl.constexpr,
+    NT: tl.int64,
+    TASK_OFFSET: tl.int64,
 ):
-    task = tl.program_id(0) + TASK_OFFSET
+    task = tl.program_id(0).to(tl.int64) + TASK_OFFSET
     i_h = task // NT
     i_t = task - i_h * NT
     o_t = tl.arange(0, BT)
@@ -139,20 +139,20 @@ def _cp_gdn_gate_factors_kernel(
     tl.store(gate_decay + i_t * HV + i_h, exp2(b_g_last))
 
 
-@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T'])
+@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT', 'TASK_OFFSET'])
 def _cp_gdn_bwd_gate_factors_kernel(
     g,
     gate_rel,
     gate_abs,
     gate_decay,
-    BOS,
-    SEGMENT_T,
+    BOS: tl.int64,
+    SEGMENT_T: tl.int64,
     HV: tl.constexpr,
     BT: tl.constexpr,
-    NT: tl.constexpr,
-    TASK_OFFSET: tl.constexpr,
+    NT: tl.int64,
+    TASK_OFFSET: tl.int64,
 ):
-    task = tl.program_id(0) + TASK_OFFSET
+    task = tl.program_id(0).to(tl.int64) + TASK_OFFSET
     i_h = task // NT
     i_t = task - i_h * NT
     o_t = tl.arange(0, BT)
@@ -169,7 +169,7 @@ def _cp_gdn_bwd_gate_factors_kernel(
     tl.store(gate_decay + i_h * NT + i_t, exp2(b_g_last))
 
 
-@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT'])
+@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT', 'TASK_OFFSET'])
 def _cp_gdn_fwd_h_kernel(
     k,
     w,
@@ -178,9 +178,9 @@ def _cp_gdn_fwd_h_kernel(
     gate_rel,
     gate_decay,
     hm,
-    BOS,
-    SEGMENT_T,
-    NT,
+    BOS: tl.int64,
+    SEGMENT_T: tl.int64,
+    NT: tl.int64,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -189,9 +189,9 @@ def _cp_gdn_fwd_h_kernel(
     BV: tl.constexpr,
     NV: tl.constexpr,
     PRECOMPUTED_GATE: tl.constexpr,
-    TASK_OFFSET: tl.constexpr,
+    TASK_OFFSET: tl.int64,
 ):
-    task = tl.program_id(0) + TASK_OFFSET
+    task = tl.program_id(0).to(tl.int64) + TASK_OFFSET
     i_h = task // NV
     i_v = task - i_h * NV
     i_kh = i_h // (HV // H)
@@ -295,7 +295,7 @@ def _cp_gdn_fwd_h_kernel(
         tl.store(p_h, b_h4, mask=(k4 < K)[:, None] & m_v[None, :])
 
 
-@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT'])
+@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT', 'TASK_OFFSET'])
 def _cp_gdn_fwd_m_kernel(
     k,
     w,
@@ -303,9 +303,9 @@ def _cp_gdn_fwd_m_kernel(
     gate_rel,
     gate_decay,
     hm,
-    BOS,
-    SEGMENT_T,
-    NT,
+    BOS: tl.int64,
+    SEGMENT_T: tl.int64,
+    NT: tl.int64,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -314,9 +314,9 @@ def _cp_gdn_fwd_m_kernel(
     BM: tl.constexpr,
     NM: tl.constexpr,
     PRECOMPUTED_GATE: tl.constexpr,
-    TASK_OFFSET: tl.constexpr,
+    TASK_OFFSET: tl.int64,
 ):
-    task = tl.program_id(0) + TASK_OFFSET
+    task = tl.program_id(0).to(tl.int64) + TASK_OFFSET
     i_h = task // NM
     i_m = task - i_h * NM
     i_kh = i_h // (HV // H)
@@ -409,7 +409,7 @@ def _cp_gdn_fwd_m_kernel(
         tl.store(p_m, b_m4, mask=(k4 < K)[:, None] & m_m[None, :])
 
 
-@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT', 'scale'])
+@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT', 'scale', 'TASK_OFFSET'])
 def _cp_gdn_bwd_dh_kernel(
     q,
     k,
@@ -418,9 +418,9 @@ def _cp_gdn_bwd_dh_kernel(
     dv,
     g,
     dhm,
-    BOS,
-    SEGMENT_T,
-    NT,
+    BOS: tl.int64,
+    SEGMENT_T: tl.int64,
+    NT: tl.int64,
     scale,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -429,9 +429,9 @@ def _cp_gdn_bwd_dh_kernel(
     BT: tl.constexpr,
     BV: tl.constexpr,
     NV: tl.constexpr,
-    TASK_OFFSET: tl.constexpr,
+    TASK_OFFSET: tl.int64,
 ):
-    task = tl.program_id(0) + TASK_OFFSET
+    task = tl.program_id(0).to(tl.int64) + TASK_OFFSET
     i_h = task // NV
     i_v = task - i_h * NV
     i_qh = i_h // (HV // H)
@@ -546,15 +546,15 @@ def _cp_gdn_bwd_dh_kernel(
         tl.store(p_dh, b_dh4, mask=(k4 < K)[:, None] & m_v[None, :])
 
 
-@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT'])
+@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT', 'TASK_OFFSET'])
 def _cp_gdn_bwd_m_kernel(
     k,
     w,
     g,
     dhm,
-    BOS,
-    SEGMENT_T,
-    NT,
+    BOS: tl.int64,
+    SEGMENT_T: tl.int64,
+    NT: tl.int64,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -562,9 +562,9 @@ def _cp_gdn_bwd_m_kernel(
     BT: tl.constexpr,
     BM: tl.constexpr,
     NM: tl.constexpr,
-    TASK_OFFSET: tl.constexpr,
+    TASK_OFFSET: tl.int64,
 ):
-    task = tl.program_id(0) + TASK_OFFSET
+    task = tl.program_id(0).to(tl.int64) + TASK_OFFSET
     i_h = task // NM
     i_m = task - i_h * NM
     i_kh = i_h // (HV // H)
@@ -652,7 +652,7 @@ def _cp_gdn_bwd_m_kernel(
         tl.store(p_m, b_m4, mask=(k4 < K)[:, None] & m_m[None, :])
 
 
-@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT', 'scale'])
+@triton.jit(do_not_specialize=['BOS', 'SEGMENT_T', 'NT', 'scale', 'TASK_OFFSET'])
 def _cp_gdn_bwd_fused_128_kernel(
     q,
     k,
@@ -664,19 +664,19 @@ def _cp_gdn_bwd_fused_128_kernel(
     gate_abs,
     gate_decay,
     dhm,
-    BOS,
-    SEGMENT_T,
-    NT,
+    BOS: tl.int64,
+    SEGMENT_T: tl.int64,
+    NT: tl.int64,
     scale,
     H: tl.constexpr,
     HV: tl.constexpr,
     BT: tl.constexpr,
     PRECOMPUTED_GATE: tl.constexpr,
     A800_PRECISION: tl.constexpr,
-    TASK_OFFSET: tl.constexpr,
+    TASK_OFFSET: tl.int64,
 ):
     """Compute dH and dM together for the K=V=128 critical path."""
-    task = tl.program_id(0) + TASK_OFFSET
+    task = tl.program_id(0).to(tl.int64) + TASK_OFFSET
     i_h = task // 2
     i_c = task - i_h * 2
     i_qh = i_h // (HV // H)
@@ -827,12 +827,12 @@ def _launch_gdn_transition(
     )
 
 
-@triton.jit(do_not_specialize=['SOURCE_RANK'])
+@triton.jit(do_not_specialize=['SOURCE_RANK', 'TASK_OFFSET'])
 def _cp_merge_one_rank_kernel(
     state_in,
     ag_hm,
     state_out,
-    SOURCE_RANK,
+    SOURCE_RANK: tl.int64,
     HV: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -842,9 +842,9 @@ def _cp_merge_one_rank_kernel(
     NV: tl.constexpr,
     ZERO_INPUT: tl.constexpr,
     OUTPUT_V_FIRST: tl.constexpr,
-    TASK_OFFSET: tl.constexpr,
+    TASK_OFFSET: tl.int64,
 ):
-    task = tl.program_id(0) + TASK_OFFSET
+    task = tl.program_id(0).to(tl.int64) + TASK_OFFSET
     tiles_per_head = NR * NV
     i_h = task // tiles_per_head
     tile = task - i_h * tiles_per_head
@@ -882,12 +882,12 @@ def _cp_merge_one_rank_kernel(
     tl.store(p_out, b_out, mask=m_r[:, None] & m_v[None, :])
 
 
-@triton.jit(do_not_specialize=['SOURCE_START', 'SOURCE_STEP'])
+@triton.jit(do_not_specialize=['SOURCE_START', 'SOURCE_STEP', 'TASK_OFFSET'])
 def _cp_merge_rank_chain_kernel(
     ag_hm,
     state_out,
-    SOURCE_START,
-    SOURCE_STEP,
+    SOURCE_START: tl.int64,
+    SOURCE_STEP: tl.int64,
     HV: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -895,10 +895,10 @@ def _cp_merge_rank_chain_kernel(
     NV: tl.constexpr,
     NUM_RANKS: tl.constexpr,
     OUTPUT_V_FIRST: tl.constexpr,
-    TASK_OFFSET: tl.constexpr,
+    TASK_OFFSET: tl.int64,
 ):
     """Compose the ordered rank chain without intermediate HBM states."""
-    task = tl.program_id(0) + TASK_OFFSET
+    task = tl.program_id(0).to(tl.int64) + TASK_OFFSET
     i_h = task // NV
     i_v = task - i_h * NV
 
@@ -967,7 +967,7 @@ def _cp_merge_rank_chain_kernel(
             tl.store(p_out, b_state2, mask=(k2 < K)[:, None] & m_v[None, :])
 
 
-@triton.jit
+@triton.jit(do_not_specialize=['TASK_OFFSET'])
 def _cp_transpose_state_kernel(
     state_in,
     state_out,
@@ -978,10 +978,10 @@ def _cp_transpose_state_kernel(
     BV: tl.constexpr,
     NK: tl.constexpr,
     NV: tl.constexpr,
-    TASK_OFFSET: tl.constexpr,
+    TASK_OFFSET: tl.int64,
 ):
     """Transpose a contiguous ``[HV, K, V]`` state using explicit strides."""
-    task = tl.program_id(0) + TASK_OFFSET
+    task = tl.program_id(0).to(tl.int64) + TASK_OFFSET
     tiles_per_head = NK * NV
     i_h = task // tiles_per_head
     tile = task - i_h * tiles_per_head

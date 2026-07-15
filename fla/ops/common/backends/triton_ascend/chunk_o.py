@@ -80,7 +80,7 @@ def _launch_fwd_o_kernel(kernel, *, nv: int, nt: int, bh_total: int, kernel_kwar
                 kernel[(v_len, nt_len, bh_len)](num_warps=_NUM_WARPS, **kernel_kwargs)
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'V_OFFSET', 'NT_OFFSET', 'BH_OFFSET'])
 def chunk_fwd_kernel_o_inter_npu(
     q,
     h,
@@ -90,7 +90,7 @@ def chunk_fwd_kernel_o_inter_npu(
     cu_seqlens,
     chunk_indices,
     scale,
-    T,
+    T: tl.int64,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -103,13 +103,13 @@ def chunk_fwd_kernel_o_inter_npu(
     USE_G_GAMMA: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    V_OFFSET: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    V_OFFSET: tl.int32,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
     i_v = tl.program_id(0) + V_OFFSET
     i_t = tl.program_id(1) + NT_OFFSET
-    i_bh = tl.program_id(2) + BH_OFFSET
+    i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
 
     if IS_VARLEN:
@@ -160,7 +160,7 @@ def chunk_fwd_kernel_o_inter_npu(
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'V_OFFSET', 'NT_OFFSET', 'BH_OFFSET'])
 def chunk_fwd_kernel_o_fused_hv1_npu(
     q,
     k,
@@ -172,7 +172,7 @@ def chunk_fwd_kernel_o_fused_hv1_npu(
     cu_seqlens,
     chunk_indices,
     scale,
-    T,
+    T: tl.int64,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -184,14 +184,14 @@ def chunk_fwd_kernel_o_fused_hv1_npu(
     USE_G_GAMMA: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    V_OFFSET: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    V_OFFSET: tl.int32,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
     """Full-BT fused inter+intra path for HV==1."""
     i_v = tl.program_id(0) + V_OFFSET
     i_t = tl.program_id(1) + NT_OFFSET
-    i_bh = tl.program_id(2) + BH_OFFSET
+    i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
 
     if IS_VARLEN:
@@ -254,7 +254,7 @@ def chunk_fwd_kernel_o_fused_hv1_npu(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'V_OFFSET', 'NT_OFFSET', 'BH_OFFSET'])
 def chunk_fwd_kernel_o_intra_hv1_npu(
     q,
     k,
@@ -265,7 +265,7 @@ def chunk_fwd_kernel_o_intra_hv1_npu(
     cu_seqlens,
     chunk_indices,
     scale,
-    T,
+    T: tl.int64,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -277,14 +277,14 @@ def chunk_fwd_kernel_o_intra_hv1_npu(
     USE_G_GAMMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     ACCUMULATE_OUTPUT: tl.constexpr,
-    V_OFFSET: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    V_OFFSET: tl.int32,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
     """Full-BT intra path for HV==1."""
     i_v = tl.program_id(0) + V_OFFSET
     i_t = tl.program_id(1) + NT_OFFSET
-    i_bh = tl.program_id(2) + BH_OFFSET
+    i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
 
     if IS_VARLEN:
@@ -332,7 +332,7 @@ def chunk_fwd_kernel_o_intra_hv1_npu(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'V_OFFSET', 'NT_OFFSET', 'BH_OFFSET'])
 def chunk_fwd_kernel_o_intra_npu(
     q,
     k,
@@ -343,7 +343,7 @@ def chunk_fwd_kernel_o_intra_npu(
     cu_seqlens,
     chunk_indices,
     scale,
-    T,
+    T: tl.int64,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -356,13 +356,13 @@ def chunk_fwd_kernel_o_intra_npu(
     USE_G_GAMMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     ACCUMULATE_OUTPUT: tl.constexpr,
-    V_OFFSET: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    V_OFFSET: tl.int32,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
     i_v = tl.program_id(0) + V_OFFSET
     i_t = tl.program_id(1) + NT_OFFSET
-    i_bh = tl.program_id(2) + BH_OFFSET
+    i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
 
     if IS_VARLEN:
@@ -592,7 +592,7 @@ def _launch_bwd_3d_kernel(
                 kernel[(1, nt_len, bh_len)](num_warps=_NUM_WARPS, **kernel_kwargs)
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def chunk_bwd_kernel_dv_local_hv1_npu(
     q,
     k,
@@ -603,7 +603,7 @@ def chunk_bwd_kernel_dv_local_hv1_npu(
     cu_seqlens,
     chunk_indices,
     scale,
-    T,
+    T: tl.int64,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -614,12 +614,12 @@ def chunk_bwd_kernel_dv_local_hv1_npu(
     USE_G: tl.constexpr,
     USE_G_GAMMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
     """Full-BT bwd_dv_local path for HV==1."""
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
 
     if IS_VARLEN:
@@ -665,7 +665,7 @@ def chunk_bwd_kernel_dv_local_hv1_npu(
         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'BH_OFFSET'])
 def chunk_bwd_kernel_dv_local_npu(
     q,
     k,
@@ -676,7 +676,7 @@ def chunk_bwd_kernel_dv_local_npu(
     cu_seqlens,
     chunk_indices,
     scale,
-    T,
+    T: tl.int64,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -688,11 +688,11 @@ def chunk_bwd_kernel_dv_local_npu(
     USE_G: tl.constexpr,
     USE_G_GAMMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
     i_t = tl.program_id(0) + NT_OFFSET
-    i_bh = tl.program_id(1) + BH_OFFSET
+    i_bh = tl.program_id(1).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
 
     if IS_VARLEN:
@@ -756,7 +756,7 @@ def chunk_bwd_kernel_dv_local_npu(
             tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['B', 'T', 'K_OFFSET', 'NT_OFFSET', 'BH_OFFSET'])
 def chunk_bwd_kernel_dqkwg_npu(
     q,
     k,
@@ -775,8 +775,8 @@ def chunk_bwd_kernel_dqkwg_npu(
     cu_seqlens,
     chunk_indices,
     scale,
-    B: tl.constexpr,
-    T,
+    B: tl.int64,
+    T: tl.int64,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -790,13 +790,13 @@ def chunk_bwd_kernel_dqkwg_npu(
     USE_DW: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    K_OFFSET: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    K_OFFSET: tl.int32,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
     i_k = tl.program_id(0) + K_OFFSET
     i_t = tl.program_id(1) + NT_OFFSET
-    i_bh = tl.program_id(2) + BH_OFFSET
+    i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
 
     if IS_VARLEN:
@@ -981,7 +981,7 @@ def chunk_bwd_kernel_dqkwg_npu(
         tl.store(p_dq_f32_r, b_dq_r, boundary_check=(0, 1))
 
 
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['B', 'T', 'K_OFFSET', 'NT_OFFSET', 'BH_OFFSET'])
 def chunk_bwd_kernel_dg_npu(
     q,
     k,
@@ -994,8 +994,8 @@ def chunk_bwd_kernel_dg_npu(
     dg,
     cu_seqlens,
     chunk_indices,
-    B: tl.constexpr,
-    T,
+    B: tl.int64,
+    T: tl.int64,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -1006,14 +1006,14 @@ def chunk_bwd_kernel_dg_npu(
     BV: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    K_OFFSET: tl.constexpr,
-    NT_OFFSET: tl.constexpr,
-    BH_OFFSET: tl.constexpr,
+    K_OFFSET: tl.int32,
+    NT_OFFSET: tl.int32,
+    BH_OFFSET: tl.int64,
 ):
     """dg kernel: b_dg_last + sum(dq*q) - sum(dk*k) from fp32 scratch."""
     i_k = tl.program_id(0) + K_OFFSET
     i_t = tl.program_id(1) + NT_OFFSET
-    i_bh = tl.program_id(2) + BH_OFFSET
+    i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // HV, i_bh % HV
 
     all = B * T
