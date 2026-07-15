@@ -69,10 +69,16 @@ o_local, _ = chunk_kda(
 
 CP context stores **rank-local** varlen metadata that tracks how sequences are distributed:
 
-- `FLACPContext.cu_seqlens` — rank-local cumulative sequence lengths, on GPU (`int64`)
+- `FLACPContext.cu_seqlens` — rank-local cumulative sequence lengths, on the accelerator (`int32`)
 - `FLACPContext.cu_seqlens_cpu` — same data on CPU for host-side indexing
 
 Variable-length inputs start as global `cu_seqlens` **before** partitioning; `build_cp_context` converts them into rank-local metadata automatically.
+
+## Ascend support
+
+The Triton-Ascend backend provides GDN CP state preprocessing and causal Conv1d kernels. GDN dispatch is limited to scalar-gated calls; other delta-rule modes continue through their existing backends. The default GDN precision mode is `high`; the optional `a800` mode is documented in [`ENVs.md`](../../../ENVs.md).
+
+Correctness tests separate compilation from execution and cover single-device kernels plus CP2/CP8 public forward and backward paths. Reproducible wall-clock benchmarks are available in `benchmarks/cp/benchmark_gdn_cp.py`, `benchmark_gdn_cp_preprocess.py`, and `benchmark_conv_cp.py`. Their default protocol uses two warmups and five samples, extending only when the coefficient of variation exceeds 10%.
 
 ---
 

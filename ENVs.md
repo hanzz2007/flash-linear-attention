@@ -31,6 +31,7 @@ runtime. Variables are grouped by what they control:
 | -------------------- | ------- | ------------------------ | ---------------------------------------------------------------------------------------------------------- |
 | `FLA_TRIL_PRECISION` | `ieee`  | `ieee` / `tf32` / `tf32x3` | Precision used by `solve_tril`. `tf32x3` is NVIDIA-only and gives the best performance / accuracy trade-off on Ampere+. |
 | `FLA_USE_FAST_OPS`   | `0`     | `0` / `1`                | Enable faster but less accurate Triton math intrinsics in shared op helpers.                               |
+| `FLA_ASCEND_CP_GDN_PRECISION` | `high` | `high` / `a800` | Precision of the Ascend GDN CP preprocessing backend. `a800` only changes the BF16 `K=V=128`, 2048-token local backward transition; all other shapes use `high`. |
 
 ---
 
