@@ -376,10 +376,20 @@
     <section class="section">
       <div class="section-head"><h2>正确性覆盖</h2><p>独立 FP32 reference；所有输出与梯度 finite</p></div>
       <div class="grid-4">
-        <div class="card compact"><h3 class="pass">12 / 12</h3><p>单 NPU dense 门禁</p><p class="muted small">BF16/FP16 · W2/3/4 · tail · state · SiLU · poisoning</p></div>
+        <div class="card compact"><h3 class="pass">16 / 16</h3><p>单 NPU dense + fallback 门禁</p><p class="muted small">BF16/FP16 · W2/3/4 · tail · state · SiLU · poisoning · split</p></div>
         <div class="card compact"><h3 class="pass">CP2 / CP4</h3><p>边界、packed varlen、subgroup</p><p class="muted small">all-gather 与 P2P 功能均通过</p></div>
         <div class="card compact"><h3 class="pass">CP8 × 4</h3><p>910B + A800，D1024 + D3072</p><p class="muted small">完整 forward/backward</p></div>
         <div class="card compact"><h3>4.342e-3</h3><p>910B CP8 dw RMS</p><p class="muted small">A800 4.335e-3；差异 0.14%</p></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head"><h2>通用 fallback 健壮性加固</h2><p>目标 dense 快路径不变；极端 grid 与大地址安全覆盖</p></div>
+      <div class="grid-4">
+        <div class="card compact"><h3>B / NT / D</h3><p>三轴 grid 分片</p><p class="muted small">所有 launch product ≤ 65535；任务恰好覆盖一次</p></div>
+        <div class="card compact"><h3>INT64</h3><p>地址形成统一加固</p><p class="muted small">program ID、offset、sequence base 与 stride product</p></div>
+        <div class="card compact"><h3 class="pass">CP2 PASS</h3><p>FP32 sequence-cut varlen</p><p class="muted small">物理 NPU 2/3；forward、backward、workspace offset</p></div>
+        <div class="card compact"><h3 class="pass">5.961 ms</h3><p>D3072 fwd+bwd p50</p><p class="muted small">p20/p80 5.942/6.006 · CV 0.61% · frozen 6.001</p></div>
       </div>
     </section>
 
@@ -428,6 +438,7 @@ torchrun --standalone --nproc_per_node=8 \
               <tr><td>Halo 与通信 A/B</td><td><code>1c0d674a</code></td></tr>
               <tr><td>Selector 与最终调优</td><td><code>a2c0be63</code></td></tr>
               <tr><td>报告</td><td><code>951da147</code></td></tr>
+              <tr><td>Fallback grid/address 加固</td><td><code>pending</code></td></tr>
             </tbody>
           </table>
           <p class="muted small">完整逐候选日志见 <a href="ASCEND_CONV_CP_OPTIMIZATION.md">ASCEND_CONV_CP_OPTIMIZATION.md</a>；Markdown 总结见 <a href="ASCEND_CONV_CP_OPTIMIZATION_SUMMARY.md">ASCEND_CONV_CP_OPTIMIZATION_SUMMARY.md</a>。</p>

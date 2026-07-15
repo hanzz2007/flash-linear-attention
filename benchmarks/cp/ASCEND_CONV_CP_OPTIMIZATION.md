@@ -186,3 +186,21 @@ The final delivery includes two synchronized summaries generated from the frozen
 Both reports explicitly mark the D3072 CP8, D1024 scaling, kernel-only, and 30% memory goals as unmet. They retain the prescribed 50-sample confirmation tails instead of filtering them and distinguish derived backward medians from direct measurements.
 
 Stage 6 commit: `951da147`.
+
+## Stage 7 — general fallback grid and address hardening
+
+The retained dense CP fast path is unchanged. The general Ascend fallback now decomposes every launch across batch, sequence-tile, and channel-block axes, so no launch exceeds the 65535-program limit even when the channel grid or batch grid alone is oversized. Forward and backward use global `B_OFFSET`, `NT_OFFSET`, and `D_BLOCK_OFFSET` values with unsliced varlen chunk metadata and gradient workspaces. `compute_dh0`, final-state update, and incremental update use the same decomposition.
+
+All fallback program IDs, grid offsets, elementwise offsets, sequence bases, and stride products are converted to int64 before address formation. The BF16 short-sequence backward path additionally checks its flattened launch size and falls back to the split general kernel when it would exceed the device limit. No convolution math, reduction order, public interface, dense selector, precision selector, or CUDA path changed.
+
+Focused tests lower the effective grid limit to four or seven programs and verify that every logical B/NT/D task is covered exactly once. On Ascend 910B, forced-split and unsplit executions produce identical output, `dx/dw/db/dh0`, final state, incremental-update output, and cache. The complete single-NPU Ascend suite passes 16 tests, including target dense kernels and NaN poisoning. A CP2 FP32 sequence-cut test passes on physical NPUs 2 and 3, covering varlen forward/backward metadata and workspace offsets.
+
+The unchanged target dense path was remeasured with three warmups and ten samples:
+
+| Shape/path | p20 | p50 | p80 | CV | Peak HBM | Frozen p50 | Decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `T=2048,D=3072,W=4,BF16`, fwd+bwd high | 5.942 ms | 5.961 ms | 6.006 ms | 0.61% | 105.1 MiB | 6.001 ms | retain; no regression |
+
+Cold process compile time was 14.343 s and was excluded from every warm sample. The 0.66% lower candidate median is within normal run-to-run variation and is recorded only as evidence that the dense target path did not regress.
+
+Stage 7 implementation commit: `pending`.

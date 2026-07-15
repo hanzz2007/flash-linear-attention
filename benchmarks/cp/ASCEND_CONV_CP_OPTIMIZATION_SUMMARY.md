@@ -238,5 +238,15 @@ A800 使用相同参数，激活 `torch211_cu128`，设置 `CUDA_VISIBLE_DEVICES
 | halo 与通信 A/B | `1c0d674a` |
 | selector、固定调度与最终矩阵 | `a2c0be63` |
 | 报告 | `951da147` |
+| 通用 fallback grid/address 加固 | `pending` |
 
 所有提交仅推送到用户 fork 的 `feat/cp-conv-triton-ascend`，没有向官方仓库创建或更新 PR。逐候选原始结论和门禁详见 [`ASCEND_CONV_CP_OPTIMIZATION.md`](ASCEND_CONV_CP_OPTIMIZATION.md)。
+
+## 12. 后续 fallback 健壮性加固
+
+目标 dense 快路径保持不变。Ascend 通用 fallback 增加 B/NT/D 三轴 grid 分片、short-sequence backward grid 门禁和完整 int64 地址形成，并将同一分片方式应用到 `dh0`、final-state 与 incremental update。
+
+- 单 NPU Ascend Conv1d：16 项全部通过。
+- 强制低 grid limit：split/unsplit 的 output、全部梯度、状态与 cache 严格一致。
+- CP2 FP32 sequence-cut varlen 前反向通过。
+- D3072 fwd+bwd 3/10 回归：p20/p50/p80 `5.942/5.961/6.006 ms`，CV `0.61%`，峰值 `105.1 MiB`；相对冻结 p50 `6.001 ms` 无回退。
