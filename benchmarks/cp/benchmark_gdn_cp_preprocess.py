@@ -41,9 +41,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument('--direction', choices=('fwd', 'bwd'), default='fwd')
     parser.add_argument(
         '--component',
-        choices=('full', 'h', 'm'),
+        choices=('full', 'local', 'gate', 'h', 'm', 'h-precomputed', 'm-precomputed'),
         default='full',
-        help='Use h/m only for single-device Triton-Ascend diagnostics.',
+        help='Use non-full components only for single-device Triton-Ascend diagnostics.',
     )
     parser.add_argument('--state-v-first', action='store_true')
     parser.add_argument('--warmup', type=int, default=3)
@@ -98,9 +98,15 @@ def _run_local_kernel(args: argparse.Namespace, inputs, scratch: torch.Tensor) -
     from fla.ops.cp.backends.triton_ascend.chunk_delta_h import (
         _backward_value_tile_size,
         _cp_gdn_bwd_dh_kernel,
+        _cp_gdn_bwd_fused_128_kernel,
+        _cp_gdn_bwd_gate_factors_kernel,
         _cp_gdn_fwd_h_kernel,
+        _cp_gdn_gate_factors_kernel,
+        _gdn_precision_mode,
         _launch_flat,
         _launch_gdn_transition,
+        _summary_stream,
+        _use_a800_transition_precision,
         _value_tile_size,
     )
 
@@ -108,7 +114,126 @@ def _run_local_kernel(args: argparse.Namespace, inputs, scratch: torch.Tensor) -
     _, local_seq_len, H, K = k.shape
     HV, V = u.shape[2], u.shape[-1]
     nt = (local_seq_len + args.chunk_size - 1) // args.chunk_size
-    if args.component == 'h':
+    if args.component in ('local', 'gate', 'h-precomputed', 'm-precomputed'):
+        if K != 128 or V != 128 or k.dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError('The local component currently covers the K=V=128 fused production path')
+        if args.direction == 'fwd':
+            current_stream = device_torch_lib.current_stream(k.device)
+            transition_stream = _summary_stream(k)
+            gate_rel = torch.empty((local_seq_len, HV), device=k.device, dtype=torch.float32)
+            gate_decay = torch.empty((nt, HV), device=k.device, dtype=torch.float32)
+            _launch_flat(
+                _cp_gdn_gate_factors_kernel,
+                HV * nt,
+                g=g,
+                gate_rel=gate_rel,
+                gate_decay=gate_decay,
+                BOS=0,
+                SEGMENT_T=local_seq_len,
+                HV=HV,
+                BT=args.chunk_size,
+                NT=nt,
+            )
+            if args.component == 'gate':
+                return scratch
+            transition_stream.wait_stream(current_stream)
+            if args.component != 'm-precomputed':
+                bv = _value_tile_size(K, V)
+                nv = (V + bv - 1) // bv
+                _launch_flat(
+                    _cp_gdn_fwd_h_kernel,
+                    HV * nv,
+                    k=k,
+                    w=w,
+                    u=u,
+                    g=g,
+                    gate_rel=gate_rel,
+                    gate_decay=gate_decay,
+                    hm=scratch,
+                    BOS=0,
+                    SEGMENT_T=local_seq_len,
+                    NT=nt,
+                    H=H,
+                    HV=HV,
+                    K=K,
+                    V=V,
+                    BT=args.chunk_size,
+                    BV=bv,
+                    NV=nv,
+                    PRECOMPUTED_GATE=True,
+                )
+            if args.component != 'h-precomputed':
+                with device_torch_lib.stream(transition_stream):
+                    _launch_gdn_transition(
+                        summary=scratch,
+                        k=k,
+                        w=w,
+                        g=g,
+                        bos=0,
+                        segment_t=local_seq_len,
+                        nt=nt,
+                        H=H,
+                        HV=HV,
+                        K=K,
+                        V=V,
+                        chunk_size=args.chunk_size,
+                        forward=True,
+                        gate_rel=gate_rel,
+                        gate_decay=gate_decay,
+                    )
+                current_stream.wait_stream(transition_stream)
+        else:
+            if args.component not in ('local', 'gate'):
+                raise ValueError('Precomputed H/M component diagnostics are forward-only')
+            gate_rel = torch.empty((HV, local_seq_len), device=q.device, dtype=torch.float32)
+            gate_abs = torch.empty((HV, local_seq_len), device=q.device, dtype=torch.float32)
+            gate_decay = torch.empty((HV, nt), device=q.device, dtype=torch.float32)
+            _launch_flat(
+                _cp_gdn_bwd_gate_factors_kernel,
+                HV * nt,
+                g=g,
+                gate_rel=gate_rel,
+                gate_abs=gate_abs,
+                gate_decay=gate_decay,
+                BOS=0,
+                SEGMENT_T=local_seq_len,
+                HV=HV,
+                BT=args.chunk_size,
+                NT=nt,
+            )
+            if args.component == 'gate':
+                return scratch
+            precision_mode = _gdn_precision_mode()
+            _launch_flat(
+                _cp_gdn_bwd_fused_128_kernel,
+                HV * 2,
+                q=q,
+                k=k,
+                w=w,
+                do=do,
+                dv=dv,
+                g=g,
+                gate_rel=gate_rel,
+                gate_abs=gate_abs,
+                gate_decay=gate_decay,
+                dhm=scratch,
+                BOS=0,
+                SEGMENT_T=local_seq_len,
+                NT=nt,
+                scale=K**-0.5,
+                H=H,
+                HV=HV,
+                BT=args.chunk_size,
+                PRECOMPUTED_GATE=True,
+                A800_PRECISION=_use_a800_transition_precision(
+                    precision_mode=precision_mode,
+                    dtype=q.dtype,
+                    K=K,
+                    V=V,
+                    segment_t=local_seq_len,
+                ),
+            )
+    elif args.component == 'h':
         bv = (
             _value_tile_size(K, V)
             if args.direction == 'fwd'

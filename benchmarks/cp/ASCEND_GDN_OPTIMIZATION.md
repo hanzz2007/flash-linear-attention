@@ -7,9 +7,8 @@ This record tracks the staged Ascend 910B optimization of GDN context-parallel p
 - Target shape: BF16, `Tglobal=16384`, `H=HV=8`, `K=V=128`, `BT=64`, CP2/CP4/CP8.
 - CP8 always uses all eight physical 910B devices exclusively.
 - Public GDN output and every gradient retain the strict RMS-ratio gate `<3e-3`, with finite and NaN-poisoning checks.
-- Internal H, dH, and merge gates retain `<1e-4`.
-- The high-precision M/dM path retains `<1e-4` and must remain available.
-- An A800-parity M/dM path may be promoted only when each supported shape stays within `1.10x` the independently measured A800 RMS-error envelope and passes the unchanged public gate.
+- The `high` H/dH/M/dM path and merge retain `<1e-4`.
+- An `a800` H/dH/M/dM specialization may be promoted only when each supported shape stays within `1.10x` the independently measured A800 RMS-error envelope and passes the unchanged public gate.
 - Triton compilation is completed before timing. Candidate timing uses five warmups and 20 samples; final evidence uses five warmups and 30 samples.
 - The HCCL payload, wire shape, collective count, and rank order are frozen.
 
@@ -80,3 +79,26 @@ The corresponding 910B throughput is 43.4%/37.5% of A800 at CP2, 38.1%/37.8% at 
 | CP4-to-CP8 efficiency within 10 percentage points of A800 | Forward 55.1% vs 65.9% (10.8 pp gap); backward 70.2% vs 67.2% | forward fail; backward pass |
 
 Median variability was low except for isolated high-tail samples in A800 CP4 backward and 910B CP4 forward/CP8 backward. Their medians, p10, and p90 remain clustered; the full logs retain CV values rather than discarding the outliers. The performance objective is not complete after this stage, and further work must target the H/dH scan and fixed distributed overhead rather than further relaxing transition precision.
+
+### Stage 4: H/dH envelope and critical-path decomposition
+
+The repository A800 H/dH kernels and the 910B `high` path were compared with the same independent FP32 recurrence. The short case is `K=V=128,BT=32,T=70,input_scale=0.2`; the CP8 case is `K=V=128,BT=64,Tlocal=2048,input_scale=0.05`.
+
+| Local state | A800 short | 910B high short | A800 CP8 | 910B high CP8 | A800+10% CP8 cap |
+| ----------- | ---------: | --------------: | --------: | -------------: | ----------------: |
+| H           |  7.051e-8 |        2.443e-8 | 5.128e-4 |       3.086e-4 |          5.640e-4 |
+| dH          |  1.880e-3 |        1.586e-4 | 1.358e-3 |       4.919e-4 |          1.494e-3 |
+
+The current 910B serial path is more accurate than A800 on all four measurements, so the user-approved A800-parity mode has numerical room without changing the public `<3e-3` gate. The previously rejected four-way associative scan remains outside that room: its CP8 H/dH ratios are `2.47e-3/2.44e-3`, or 4.4x/1.6x the respective A800+10% caps. It is not revived. A two-way scan is the next bounded candidate because it changes fewer recurrence boundaries and can be rejected before timing if either cap fails.
+
+Production-equivalent single-device diagnostics include gate precomputation and the actual concurrent-stream/fused scheduling. Values below are three warmups and ten samples, with compilation excluded.
+
+| Local T | fwd gate | gate+H | gate+M | concurrent local fwd | bwd gate | fused local bwd |
+| ------: | -------: | -----: | -----: | -------------------: | -------: | --------------: |
+|    2048 | 0.272 ms | 0.621 ms | 0.718 ms | 0.849 ms | 0.238 ms | 0.742 ms |
+|    4096 |        — |        — |        — | 1.120 ms |        — | 1.263 ms |
+|    8192 | 0.380 ms | 1.174 ms | 1.438 ms | 1.627 ms | 0.323 ms | 2.173 ms |
+
+The CP8 row uses the promoted BF16 dM specialization; CP2/CP4-sized backward rows automatically use `high`. Precomputed H/M timings include the shared gate launch, so they diagnose the production schedule but are not additive. The old standalone H/M modes recompute gates inside each scan and are deliberately excluded from this table.
+
+An exclusive eight-card decomposition of the unchanged FP32 summary protocol measured a `0.353 ms` all-gather median, `0.284/0.286 ms` forward/backward merge medians, and `0.482/0.495 ms` combined communication-plus-merge medians. These are slowest-rank values; stage maxima are not additive because the boundary rank that has the longest merge skips the local summary. Nevertheless, the collective alone consumes 81% of the `0.433 ms` CP8 forward budget and 77% of the `0.457 ms` backward budget implied by the 1.10x A800 target. Local scans and the fixed distributed path must both improve; an H/dH-only change cannot meet the absolute target. The HCCL dtype, shape, collective count, and rank order remain unchanged.
