@@ -1,0 +1,152 @@
+name: ascend-cp-nightly
+
+# Pinned stack: CANN 9.0.0 + pyproject [npu] extra.
+
+on:
+  schedule:
+    - cron: "30 17 * * *"
+  workflow_dispatch:
+
+jobs:
+  cp-nightly:
+    name: Ascend CP nightly correctness and stability
+    runs-on: linux-aarch64-a2-8
+    timeout-minutes: 360
+    concurrency:
+      group: ascend-cp-nightly
+      cancel-in-progress: false
+    container:
+      image: ascendai/cann:9.0.0-910b-ubuntu22.04-py3.11
+      options: --shm-size 16g
+    env:
+      FLA_CI_ENV: 1
+      FLA_NPU_XDIST: "0"
+      FLA_ASCEND_CP_GDN_PRECISION: high
+      FLA_ASCEND_CONV_PRECISION: high
+      ASCEND_RT_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+      ASCEND_UB_CAPACITY_BITS: "1572864"
+      HCCL_NPU_SOCKET_PORT_RANGE: auto
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip setuptools wheel
+          python -m pip install pybind11 cmake attrs sympy pyyaml scipy decorator einops
+          python -m pip install ".[npu,test]" \
+            --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple
+
+      - name: Run nightly single-NPU boundary matrix
+        shell: bash
+        env:
+          FLA_NPU_XDIST: "1"
+        run: |
+          set -o pipefail
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          mkdir -p test-results
+          pytest -s -v --exitfirst -n 8 --dist loadfile \
+            -m "ascend_npu and nightly and not cp_distributed" \
+            --junitxml=test-results/nightly-single.xml \
+            tests/context_parallel/test_cp_gdn_preprocess.py \
+            tests/modules/test_conv_triton_ascend.py \
+            2>&1 | tee test-results/nightly-single.log
+
+      - name: Run complete CP2 CP4 CP8 matrix exclusively
+        timeout-minutes: 240
+        shell: bash
+        run: |
+          set -o pipefail
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          pytest -s -v --exitfirst -n 0 \
+            -m "cp_distributed" \
+            --junitxml=test-results/nightly-distributed.xml \
+            tests/context_parallel/test_cp_gdn.py \
+            tests/context_parallel/test_cp_gdn_preprocess.py \
+            tests/context_parallel/test_cp_conv.py \
+            2>&1 | tee test-results/nightly-distributed.log
+
+      - name: Run 8 fixed CP8 seeds
+        timeout-minutes: 90
+        shell: bash
+        run: |
+          set -o pipefail
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          : > test-results/nightly-seeds.log
+          for seed in $(seq 0 7); do
+            python -m torch.distributed.run --standalone --nproc-per-node=8 \
+              benchmarks/cp/benchmark_gdn_cp.py \
+              --mode fwd_bwd --total-seq-len 16384 --q-heads 8 --v-heads 8 \
+              --seed "${seed}" --warmup 0 --samples 1 --confirm-samples 1 \
+              2>&1 | tee -a test-results/nightly-seeds.log
+            python -m torch.distributed.run --standalone --nproc-per-node=8 \
+              benchmarks/cp/benchmark_conv_cp.py \
+              --kind cp --mode fwd_bwd --total-seq-len 16384 --dim 1024 \
+              --lengths 3000,4000,5000,4384 --precision high \
+              --seed "${seed}" --warmup 0 --samples 1 --confirm-samples 1 \
+              2>&1 | tee -a test-results/nightly-seeds.log
+          done
+
+      - name: Run 50-iteration CP8 stability loops
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          set -o pipefail
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          : > test-results/nightly-stability.log
+          python -m torch.distributed.run --standalone --nproc-per-node=8 \
+            benchmarks/cp/benchmark_gdn_cp.py \
+            --mode fwd_bwd --total-seq-len 16384 --q-heads 8 --v-heads 8 \
+            --warmup 3 --samples 50 --confirm-samples 50 \
+            2>&1 | tee -a test-results/nightly-stability.log
+          python -m torch.distributed.run --standalone --nproc-per-node=8 \
+            benchmarks/cp/benchmark_conv_cp.py \
+            --kind cp --mode fwd_bwd --total-seq-len 16384 --dim 1024 \
+            --lengths 3000,4000,5000,4384 --precision high \
+            --warmup 3 --samples 50 --confirm-samples 50 \
+            2>&1 | tee -a test-results/nightly-stability.log
+
+      - name: Validate stability records
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          prefixes = ("GDN_CP_BENCH_RESULT=", "CONV_CP_BENCH_RESULT=")
+
+          def records(path):
+              return [
+                  json.loads(line.split("=", 1)[1])
+                  for line in Path(path).read_text().splitlines()
+                  if line.startswith(prefixes)
+              ]
+
+          seed_records = records("test-results/nightly-seeds.log")
+          stability_records = records("test-results/nightly-stability.log")
+          assert len(seed_records) == 16, len(seed_records)
+          assert {record["seed"] for record in seed_records} == set(range(8))
+          assert len(stability_records) == 2, len(stability_records)
+          assert all(record["samples"] == 50 for record in stability_records)
+          for record in stability_records:
+              peak = record["peak_memory_bytes"]
+              growth = record["memory_growth_bytes"]
+              assert not peak or growth <= peak * 0.05, (growth, peak, record)
+          PY
+
+      - name: Upload nightly logs and CANN plog
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ascend-cp-nightly-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            test-results
+            /root/ascend/log
+            /github/home/ascend/log

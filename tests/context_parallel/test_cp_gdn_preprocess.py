@@ -1101,3 +1101,20 @@ def test_non_gdn_cp4_primitive(mode: str) -> None:
         join=True,
         start_method="spawn",
     )
+
+
+@pytest.mark.cp_distributed
+@pytest.mark.cp8
+@pytest.mark.nightly
+@pytest.mark.parametrize("mode", ["kda", "dplr"])
+def test_non_gdn_cp8_primitive(mode: str) -> None:
+    """Smoke the shared KDA/DPLR CP summaries across a seven-rank merge chain."""
+    if device_torch_lib.device_count() < 8:
+        pytest.skip("At least eight accelerator devices are required")
+    mp.start_processes(
+        _non_gdn_worker,
+        args=(8, mode, _free_port()),
+        nprocs=8,
+        join=True,
+        start_method="spawn",
+    )

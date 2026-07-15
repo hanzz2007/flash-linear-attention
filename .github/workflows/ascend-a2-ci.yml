@@ -8,34 +8,37 @@ on:
     branches:
       - main
     paths:
-      - "**/*.py"
+      - "fla/ops/cp/**"
+      - "fla/ops/gated_delta_rule/**"
+      - "fla/modules/conv/**"
+      - "fla/modules/backends/triton_ascend/**"
+      - "fla/ops/backends/**"
+      - "fla/utils/**"
+      - "tests/context_parallel/**"
+      - "tests/modules/*conv*ascend*"
+      - "benchmarks/cp/**"
       - "pyproject.toml"
-      - ".github/workflows/*.yml"
+      - ".github/workflows/ascend-*.yml"
   pull_request:
     branches:
       - main
     types: [opened, synchronize, reopened, edited]
     paths:
-      - "**/*.py"
+      - "fla/ops/cp/**"
+      - "fla/ops/gated_delta_rule/**"
+      - "fla/modules/conv/**"
+      - "fla/modules/backends/triton_ascend/**"
+      - "fla/ops/backends/**"
+      - "fla/utils/**"
+      - "tests/context_parallel/**"
+      - "tests/modules/*conv*ascend*"
+      - "benchmarks/cp/**"
       - "pyproject.toml"
-      - ".github/workflows/*.yml"
+      - ".github/workflows/ascend-*.yml"
 
 jobs:
   test-a2-npu-pytorch-2-7:
     name: Test A2 NPU (PyTorch 2.7.1)
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'push' ||
-      (
-        github.event_name == 'pull_request' &&
-        (
-          contains(github.event.pull_request.title, 'npu') ||
-          contains(github.event.pull_request.title, 'NPU') ||
-          contains(github.event.pull_request.title, 'ascend') ||
-          contains(github.event.pull_request.title, 'Ascend') ||
-          contains(github.event.pull_request.title, 'ASCEND')
-        )
-      )
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +63,10 @@ jobs:
     env:
       FLA_CI_ENV: 1
       ASCEND_RT_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+      ASCEND_UB_CAPACITY_BITS: "1572864"
+      HCCL_NPU_SOCKET_PORT_RANGE: auto
+      FLA_ASCEND_CP_GDN_PRECISION: high
+      FLA_ASCEND_CONV_PRECISION: high
 
     steps:
       - name: Checkout
@@ -105,14 +112,74 @@ jobs:
           assert IS_NPU, "Expected NPU backend (IS_NPU=True)"
           PY
 
-      - name: Run fla/modules, fla/ops/utils and fla/ops/gdn tests
+      - name: Run CP protocol and coverage contracts
+        shell: bash
+        run: |
+          set -o pipefail
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          mkdir -p test-results
+          pytest -s -v --exitfirst \
+            --junitxml=test-results/cp-protocol.xml \
+            tests/context_parallel/test_cp_context.py \
+            tests/context_parallel/test_cp_benchmark_runner.py \
+            tests/modules/test_conv_ascend_coverage.py \
+            2>&1 | tee test-results/cp-protocol.log
+
+      - name: Run single-NPU GDN and Conv kernels
         shell: bash
         env:
           FLA_NPU_XDIST: "1"
         run: |
+          set -o pipefail
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
           pytest -s -v --exitfirst -n 8 --dist loadfile \
-            tests/modules \
-            tests/ops/utils \
-            tests/ops/test_gdn_kernels.py \
-            tests/ops/test_gdn.py
+            -m "ascend_npu and not nightly and not cp_distributed" \
+            --junitxml=test-results/single-npu.xml \
+            tests/context_parallel/test_cp_gdn_preprocess.py \
+            tests/modules/test_conv_triton_ascend.py \
+            2>&1 | tee test-results/single-npu.log
+
+      - name: Run exclusive CP2 and CP4 gates
+        timeout-minutes: 60
+        shell: bash
+        env:
+          FLA_NPU_XDIST: "0"
+        run: |
+          set -o pipefail
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          pytest -s -v --exitfirst -n 0 \
+            --junitxml=test-results/cp2-cp4.xml \
+            tests/context_parallel/test_cp_gdn.py::test_cp2_fp16_chunk16_gva_tail \
+            tests/context_parallel/test_cp_gdn.py::test_cp2_fused_gate_beta_qk_norm \
+            tests/context_parallel/test_cp_gdn.py::test_cp4_complex \
+            tests/context_parallel/test_cp_gdn_preprocess.py::test_non_gdn_cp4_primitive \
+            tests/context_parallel/test_cp_conv.py::test_cp2_bfloat16_target_smoke \
+            tests/context_parallel/test_cp_conv.py::test_cp4_multi_hop_short_local_chunk \
+            tests/context_parallel/test_cp_conv.py::test_cp_noncontiguous_subgroup \
+            2>&1 | tee test-results/cp2-cp4.log
+
+      - name: Run exclusive CP8 high-precision gates
+        timeout-minutes: 45
+        shell: bash
+        env:
+          FLA_NPU_XDIST: "0"
+        run: |
+          set -o pipefail
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          pytest -s -v --exitfirst -n 0 \
+            -m "cp8 and not nightly" \
+            --junitxml=test-results/cp8.xml \
+            tests/context_parallel/test_cp_gdn.py \
+            tests/context_parallel/test_cp_conv.py \
+            2>&1 | tee test-results/cp8.log
+
+      - name: Upload CP logs and CANN plog
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ascend-cp-pr-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            test-results
+            /root/ascend/log
+            /github/home/ascend/log

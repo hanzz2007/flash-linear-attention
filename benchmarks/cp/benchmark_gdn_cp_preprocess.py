@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
 import statistics
@@ -17,6 +18,7 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+import triton
 
 with suppress(ImportError):
     import torch_npu  # noqa: F401
@@ -27,6 +29,12 @@ from fla.ops.cp.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h_pre_process,
 )
 from fla.utils import IS_NPU, device, device_torch_lib
+
+
+def _package_version(name: str) -> str | None:
+    with suppress(importlib.metadata.PackageNotFoundError):
+        return importlib.metadata.version(name)
+    return None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -46,9 +54,15 @@ def _parse_args() -> argparse.Namespace:
         help='Use non-full components only for single-device Triton-Ascend diagnostics.',
     )
     parser.add_argument('--state-v-first', action='store_true')
-    parser.add_argument('--warmup', type=int, default=3)
-    parser.add_argument('--samples', type=int, default=10)
-    return parser.parse_args()
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--warmup', type=int, default=2)
+    parser.add_argument('--samples', type=int, default=5)
+    parser.add_argument('--confirm-samples', type=int, default=20)
+    parser.add_argument('--cv-threshold', type=float, default=0.10)
+    args = parser.parse_args()
+    if args.warmup < 0 or args.samples <= 0 or args.confirm_samples < args.samples or args.cv_threshold <= 0:
+        parser.error('require warmup >= 0, samples > 0, confirm-samples >= samples, and cv-threshold > 0')
+    return args
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -65,7 +79,7 @@ def _percentile(values: list[float], percentile: float) -> float:
 def _make_inputs(args: argparse.Namespace, local_seq_len: int, local_rank: int):
     dtype = getattr(torch, args.dtype)
     device_obj = torch.device(device, local_rank)
-    torch.manual_seed(20260714 + local_rank)
+    torch.manual_seed(args.seed + local_rank)
 
     def randn(*shape: int) -> torch.Tensor:
         return (torch.randn(*shape, device=device_obj, dtype=torch.float32) * 0.04).to(dtype)
@@ -348,13 +362,21 @@ def _peak_memory() -> int:
     return 0
 
 
+def _memory_allocated() -> int:
+    if hasattr(device_torch_lib, 'memory_allocated'):
+        return int(device_torch_lib.memory_allocated())
+    return 0
+
+
 def main() -> None:
     args = _parse_args()
+    os.environ['FLA_ASCEND_CP_GDN_PRECISION'] = 'high'
     local_rank = int(os.environ.get('LOCAL_RANK', os.environ.get('RANK', 0)))
     visible_var = 'ASCEND_RT_VISIBLE_DEVICES' if IS_NPU else 'CUDA_VISIBLE_DEVICES'
     visible_devices = os.environ.get(visible_var, '').split(',')
     device_key = visible_devices[local_rank].strip() if len(visible_devices) > local_rank else str(local_rank)
-    os.environ.setdefault('TRITON_CACHE_DIR', f'/tmp/fla-triton-cache-{device}-{device_key}')
+    cache_root = os.environ.get('FLA_BENCH_CACHE_ROOT', '/tmp')
+    os.environ.setdefault('TRITON_CACHE_DIR', f'{cache_root}/fla-triton-cache-{device}-{device_key}')
     if IS_NPU:
         os.environ.setdefault('HCCL_NPU_SOCKET_PORT_RANGE', 'auto')
         from fla.ops.cp.backends.triton_ascend.chunk_delta_h import _gdn_precision_mode
@@ -384,8 +406,12 @@ def main() -> None:
         device=device_obj,
     )
 
+    device_torch_lib.synchronize()
+    dist.barrier()
+    compile_start = time.perf_counter_ns()
     result = _run_once(args, inputs, context, scratch)
     device_torch_lib.synchronize()
+    compile_ms = (time.perf_counter_ns() - compile_start) / 1e6
     finite = torch.tensor(float(torch.isfinite(result).all().item()), device=device_obj)
     dist.all_reduce(finite, op=dist.ReduceOp.MIN)
     if not finite.item():
@@ -397,20 +423,45 @@ def main() -> None:
     dist.barrier()
 
     _reset_peak_memory()
-    samples = []
-    for _ in range(args.samples):
+    allocated_before = _memory_allocated()
+    samples: list[float] = []
+    last_result = result
+
+    def take_sample() -> None:
+        nonlocal last_result
         dist.barrier()
         device_torch_lib.synchronize()
         started = time.perf_counter_ns()
-        _run_once(args, inputs, context, scratch)
+        last_result = _run_once(args, inputs, context, scratch)
         device_torch_lib.synchronize()
         local_ms = (time.perf_counter_ns() - started) / 1e6
         critical_ms = torch.tensor(local_ms, dtype=torch.float32, device=device_obj)
         dist.all_reduce(critical_ms, op=dist.ReduceOp.MAX)
         samples.append(critical_ms.item())
 
+    for _ in range(args.samples):
+        take_sample()
+    mean_ms = statistics.fmean(samples)
+    cv = statistics.pstdev(samples) / mean_ms if mean_ms else 0.0
+    if cv > args.cv_threshold and len(samples) < args.confirm_samples:
+        for _ in range(args.confirm_samples - len(samples)):
+            take_sample()
+
+    finite = torch.tensor(float(torch.isfinite(last_result).all().item()), device=device_obj)
+    dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+    if not finite.item():
+        raise AssertionError('GDN CP preprocessing became non-finite during measured iterations')
+
     peak_memory = torch.tensor(_peak_memory(), dtype=torch.int64, device=device_obj)
     dist.all_reduce(peak_memory, op=dist.ReduceOp.MAX)
+    memory_growth = torch.tensor(
+        max(0, _memory_allocated() - allocated_before),
+        dtype=torch.int64,
+        device=device_obj,
+    )
+    dist.all_reduce(memory_growth, op=dist.ReduceOp.MAX)
+    compile_time = torch.tensor(compile_ms, dtype=torch.float32, device=device_obj)
+    dist.all_reduce(compile_time, op=dist.ReduceOp.MAX)
 
     if rank == 0:
         mean_ms = statistics.fmean(samples)
@@ -419,6 +470,9 @@ def main() -> None:
         result = {
             'backend': 'hccl' if IS_NPU else 'nccl',
             'device': device_torch_lib.get_device_name(local_rank),
+            'torch': torch.__version__,
+            'triton': triton.__version__,
+            'triton_ascend': _package_version('triton-ascend'),
             'world_size': world_size,
             'direction': args.direction,
             'component': args.component,
@@ -432,17 +486,22 @@ def main() -> None:
             'value_dim': args.value_dim,
             'chunk_size': args.chunk_size,
             'state_v_first': args.state_v_first,
+            'seed': args.seed,
             'warmup': args.warmup,
-            'samples': args.samples,
+            'requested_samples': args.samples,
+            'samples': len(samples),
+            'cv_threshold': args.cv_threshold,
+            'compile_ms': compile_time.item(),
             'tokens_per_second': args.total_seq_len / (median_ms / 1e3),
             'peak_memory_bytes': int(peak_memory.item()),
+            'memory_growth_bytes': int(memory_growth.item()),
             'latency_ms': {
                 'min': min(samples),
-                'p10': _percentile(samples, 10),
+                'p20': _percentile(samples, 20),
                 'median': median_ms,
                 'mean': mean_ms,
                 'std': std_ms,
-                'p90': _percentile(samples, 90),
+                'p80': _percentile(samples, 80),
                 'max': max(samples),
                 'cv': std_ms / mean_ms if mean_ms else 0.0,
             },

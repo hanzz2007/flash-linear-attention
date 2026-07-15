@@ -42,11 +42,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, choices=(2, 3, 4), default=4)
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--activation", choices=("none", "silu"), default="silu")
-    parser.add_argument("--precision", choices=("high", "a800"), default="high")
+    parser.add_argument("--precision", choices=("high",), default="high")
     parser.add_argument("--comm", choices=("all_gather", "p2p"), default="all_gather")
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--samples", type=int, default=10)
-    return parser.parse_args()
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--confirm-samples", type=int, default=20)
+    parser.add_argument("--cv-threshold", type=float, default=0.10)
+    args = parser.parse_args()
+    if args.warmup < 0 or args.samples <= 0 or args.confirm_samples < args.samples or args.cv_threshold <= 0:
+        parser.error("require warmup >= 0, samples > 0, confirm-samples >= samples, and cv-threshold > 0")
+    return args
 
 
 def _package_version(name: str) -> str | None:
@@ -66,6 +72,12 @@ def _percentile(values: list[float], percentile: float) -> float:
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
 
 
+def _memory_allocated() -> int:
+    if hasattr(device_torch_lib, "memory_allocated"):
+        return int(device_torch_lib.memory_allocated())
+    return 0
+
+
 def _build_lengths(args: argparse.Namespace) -> list[int]:
     if args.lengths is None:
         return [args.total_seq_len]
@@ -83,7 +95,7 @@ def _make_inputs(args: argparse.Namespace, local_rank: int, world_size: int, len
     local_seq_len = args.total_seq_len // world_size
     worker_device = torch.device(device, local_rank)
     dtype = getattr(torch, args.dtype)
-    torch.manual_seed(42 + local_rank)
+    torch.manual_seed(args.seed + local_rank)
     x = torch.randn(1, local_seq_len, args.dim, device=worker_device, dtype=dtype, requires_grad=True)
     weight = torch.randn(args.dim, args.width, device=worker_device, dtype=dtype, requires_grad=True)
     bias = torch.randn(args.dim, device=worker_device, dtype=dtype, requires_grad=True)
@@ -152,26 +164,51 @@ def _measure(args: argparse.Namespace, inputs, do: torch.Tensor | None, cp_conte
 
     if hasattr(device_torch_lib, "reset_peak_memory_stats"):
         device_torch_lib.reset_peak_memory_stats()
-    samples = []
-    for _ in range(args.samples):
+    allocated_before = _memory_allocated()
+    samples: list[float] = []
+    last_output = output
+
+    def take_sample() -> None:
+        nonlocal last_output
         dist.barrier()
         device_torch_lib.synchronize()
         started = time.perf_counter_ns()
-        _run_once(args, inputs, do, cp_context)
+        last_output = _run_once(args, inputs, do, cp_context)
         device_torch_lib.synchronize()
         local_ms = (time.perf_counter_ns() - started) / 1e6
         critical_ms = torch.tensor(local_ms, dtype=torch.float32, device=worker_device)
         dist.all_reduce(critical_ms, op=dist.ReduceOp.MAX)
         samples.append(critical_ms.item())
 
+    for _ in range(args.samples):
+        take_sample()
+    mean_ms = statistics.fmean(samples)
+    cv = statistics.pstdev(samples) / mean_ms if mean_ms else 0.0
+    if cv > args.cv_threshold and len(samples) < args.confirm_samples:
+        for _ in range(args.confirm_samples - len(samples)):
+            take_sample()
+
+    tensors = [last_output]
+    if args.mode == "fwd_bwd" and args.kind != "comm":
+        tensors.extend(tensor.grad for tensor in inputs[:3])
+    finite = torch.tensor(
+        float(all(tensor is not None and torch.isfinite(tensor).all().item() for tensor in tensors)),
+        device=worker_device,
+    )
+    dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+    if not finite.item():
+        raise AssertionError("Conv1d benchmark became non-finite during measured iterations")
+
     peak_memory = 0
     if hasattr(device_torch_lib, "max_memory_allocated"):
         peak_memory = int(device_torch_lib.max_memory_allocated())
     peak = torch.tensor(peak_memory, dtype=torch.int64, device=worker_device)
     dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+    memory_growth = torch.tensor(max(0, _memory_allocated() - allocated_before), dtype=torch.int64, device=worker_device)
+    dist.all_reduce(memory_growth, op=dist.ReduceOp.MAX)
     compile_time = torch.tensor(compile_ms, dtype=torch.float32, device=worker_device)
     dist.all_reduce(compile_time, op=dist.ReduceOp.MAX)
-    return samples, int(peak.item()), compile_time.item()
+    return samples, int(peak.item()), compile_time.item(), int(memory_growth.item())
 
 
 def main() -> None:
@@ -182,7 +219,8 @@ def main() -> None:
     visible_var = "ASCEND_RT_VISIBLE_DEVICES" if IS_NPU else "CUDA_VISIBLE_DEVICES"
     visible_devices = os.environ.get(visible_var, "").split(",")
     device_key = visible_devices[local_rank].strip() if len(visible_devices) > local_rank else str(local_rank)
-    os.environ.setdefault("TRITON_CACHE_DIR", f"/tmp/fla-triton-cache-{device}-{device_key}")
+    cache_root = os.environ.get("FLA_BENCH_CACHE_ROOT", "/tmp")
+    os.environ.setdefault("TRITON_CACHE_DIR", f"{cache_root}/fla-triton-cache-{device}-{device_key}")
     if IS_NPU:
         os.environ.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "auto")
         os.environ.setdefault("HCCL_CONNECT_TIMEOUT", "600")
@@ -200,7 +238,7 @@ def main() -> None:
         inputs, do, cp_context = (halo,), None, None
     else:
         inputs, do, cp_context = _make_inputs(args, local_rank, world_size, lengths)
-    samples, peak_memory, compile_ms = _measure(args, inputs, do, cp_context, worker_device)
+    samples, peak_memory, compile_ms, memory_growth = _measure(args, inputs, do, cp_context, worker_device)
 
     effective_precision = "cuda"
     if IS_NPU:
@@ -233,8 +271,11 @@ def main() -> None:
             "total_seq_len": args.total_seq_len,
             "local_seq_len": args.total_seq_len // world_size,
             "lengths": lengths,
+            "seed": args.seed,
             "warmup": args.warmup,
-            "samples": args.samples,
+            "requested_samples": args.samples,
+            "samples": len(samples),
+            "cv_threshold": args.cv_threshold,
             "compile_ms": compile_ms,
             "latency_ms": {
                 "min": min(samples),
@@ -248,6 +289,7 @@ def main() -> None:
             },
             "global_tokens_per_second": args.total_seq_len / (median_ms / 1e3),
             "peak_memory_bytes": peak_memory,
+            "memory_growth_bytes": memory_growth,
         }
         print(f"CONV_CP_BENCH_RESULT={json.dumps(result, sort_keys=True)}", flush=True)
 
