@@ -237,6 +237,6 @@ A800 使用相同参数，激活 `torch211_cu128`，设置 `CUDA_VISIBLE_DEVICES
 | Ascend backward pipeline | `0cc12b6a` |
 | halo 与通信 A/B | `1c0d674a` |
 | selector、固定调度与最终矩阵 | `a2c0be63` |
-| 报告 | 本阶段提交 |
+| 报告 | `951da147` |
 
 所有提交仅推送到用户 fork 的 `feat/cp-conv-triton-ascend`，没有向官方仓库创建或更新 PR。逐候选原始结论和门禁详见 [`ASCEND_CONV_CP_OPTIMIZATION.md`](ASCEND_CONV_CP_OPTIMIZATION.md)。

@@ -185,4 +185,4 @@ The final delivery includes two synchronized summaries generated from the frozen
 
 Both reports explicitly mark the D3072 CP8, D1024 scaling, kernel-only, and 30% memory goals as unmet. They retain the prescribed 50-sample confirmation tails instead of filtering them and distinguish derived backward medians from direct measurements.
 
-Stage 6 commit: pending.
+Stage 6 commit: `951da147`.
