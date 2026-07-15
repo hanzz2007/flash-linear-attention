@@ -175,3 +175,14 @@ CP8 correctness passes on both HCCL/910B and NCCL/A800 for D1024 and D3072. The 
 The first cold distributed specializations took about 14 s on the 910B stack and 38 s on the A800 stack. Compilation is reported independently and excluded from every warm latency sample.
 
 Stage 5 commit: `a2c0be63`.
+
+## Stage 6 — final reports
+
+The final delivery includes two synchronized summaries generated from the frozen Stage 5 evidence:
+
+- `ASCEND_CONV_CP_OPTIMIZATION_SUMMARY.md`: review-friendly Markdown covering the implementation, retained/rejected candidates, correctness, kernel-only and CP2/4/8 results, scaling efficiency, and the remaining A800 gap.
+- `ASCEND_CONV_CP_OPTIMIZATION_SUMMARY_WIDE.html`: standalone wide-screen dashboard with inline CSS/SVG charts and no external runtime dependency.
+
+Both reports explicitly mark the D3072 CP8, D1024 scaling, kernel-only, and 30% memory goals as unmet. They retain the prescribed 50-sample confirmation tails instead of filtering them and distinguish derived backward medians from direct measurements.
+
+Stage 6 commit: pending.
