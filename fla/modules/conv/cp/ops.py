@@ -8,7 +8,7 @@
 import torch
 import torch.distributed as dist
 
-from fla.ops.cp import FLACPContext, conv_cp_send_recv_bwd, conv_cp_send_recv_fwd
+from fla.ops.cp import FLACPContext, all_gather_into_tensor, conv_cp_send_recv_bwd, conv_cp_send_recv_fwd
 from fla.ops.utils import prepare_chunk_indices
 
 
@@ -24,6 +24,64 @@ class CausalConv1dFunctionCP(torch.autograd.Function):
         1. Call causal_conv1d_bwd to get dx
         2. Sync communication: add next rank's first W-1 token gradients to current rank's last W-1 tokens
     """
+
+    @staticmethod
+    def _right_aligned_halo(x: torch.Tensor, halo_len: int) -> torch.Tensor:
+        """Return a fixed-size halo with short inputs padded on the left."""
+        assert x.dim() == 2, f"halo source must be [T, D], got {x.shape}"
+        halo = x.new_zeros(halo_len, x.shape[-1])
+        valid_len = min(halo_len, x.shape[0])
+        if valid_len > 0:
+            halo[-valid_len:].copy_(x[-valid_len:])
+        return halo
+
+    @staticmethod
+    def _assemble_previous_halo(
+        gathered_halos: torch.Tensor,
+        *,
+        rank: int,
+        local_t: int,
+        needed: int,
+    ) -> torch.Tensor:
+        """Assemble up to W-1 preceding tokens from one or more earlier ranks."""
+        _, halo_len, D = gathered_halos.shape
+        result = gathered_halos.new_zeros(halo_len, D)
+        if needed == 0:
+            return result
+        valid_per_rank = min(halo_len, local_t)
+        history = gathered_halos[:rank, -valid_per_rank:].reshape(-1, D)
+        if history.shape[0] < needed:
+            raise RuntimeError(f"CP halo requires {needed} prior tokens, but only {history.shape[0]} are available")
+        result[-needed:] = history[-needed:]
+        return result
+
+    @staticmethod
+    def _accumulate_multi_rank_halo_gradients(
+        dx: torch.Tensor,
+        gathered_gradients: torch.Tensor,
+        *,
+        rank: int,
+    ) -> None:
+        """Map right-aligned source halos back to their global token owners."""
+        local_t = dx.shape[1]
+        halo_len = gathered_gradients.shape[1]
+        target_start = rank * local_t
+        target_end = target_start + local_t
+        correction = torch.zeros_like(dx, dtype=torch.float32)
+        for source_rank in range(rank + 1, gathered_gradients.shape[0]):
+            source_start = source_rank * local_t - halo_len
+            source_end = source_rank * local_t
+            overlap_start = max(target_start, source_start)
+            overlap_end = min(target_end, source_end)
+            if overlap_start >= overlap_end:
+                continue
+            dx_start = overlap_start - target_start
+            grad_start = overlap_start - source_start
+            length = overlap_end - overlap_start
+            correction[0, dx_start : dx_start + length].add_(
+                gathered_gradients[source_rank, grad_start : grad_start + length].float()
+            )
+        dx.copy_((dx.float() + correction).to(dx.dtype))
 
     @staticmethod
     def _prepare_initial_state_for_cp(
@@ -50,26 +108,28 @@ class CausalConv1dFunctionCP(torch.autograd.Function):
 
         W = weight.shape[-1]  # weight: [D, W]
         D = weight.shape[0]
-        initial_state = None
-        if not context.is_first_rank:
-            # Non-first rank needs initial_state
-            assert x.dim() == 3 and x.shape[0] == 1, f"CP requires [1, T, D], got {x.shape}"
-            x_2d = x.squeeze(0)  # [T, D]
-            tails = x_2d[-(W-1):].contiguous()  # [W-1, D]
-            heads = conv_cp_send_recv_fwd(tails, group)  # [W-1, D]
-            # Construct initial_state: [N, D, W]
-            N = len(cu_seqlens) - 1
-            initial_state = torch.zeros(N, D, W, device=x.device, dtype=x.dtype)
-            valid_len = min(W - 1, context.pre_num_conv_tokens)
-            if valid_len > 0:
-                # heads[-valid_len:]: [valid_len, D] -> [D, valid_len]
-                initial_state[0, :, -valid_len:] = heads[-valid_len:].T
+        assert x.dim() == 3 and x.shape[0] == 1, f"CP requires [1, T, D], got {x.shape}"
+        tails = CausalConv1dFunctionCP._right_aligned_halo(x.squeeze(0), W - 1)
+        if x.shape[1] < W - 1:
+            gathered_halos, _ = all_gather_into_tensor(tails, group=group)
+            heads = CausalConv1dFunctionCP._assemble_previous_halo(
+                gathered_halos,
+                rank=dist.get_rank(group),
+                local_t=x.shape[1],
+                needed=min(W - 1, context.pre_num_conv_tokens),
+            )
         else:
-            # First rank also needs to participate in communication (send tails)
-            x_2d = x.squeeze(0)
-            tails = x_2d[-(W-1):].contiguous()
-            _ = conv_cp_send_recv_fwd(tails, group)  # Send but don't use
+            heads = conv_cp_send_recv_fwd(tails, group)
+        if context.is_first_rank:
+            return None
 
+        # Non-first rank needs initial_state.
+        N = len(cu_seqlens) - 1
+        initial_state = torch.zeros(N, D, W, device=x.device, dtype=x.dtype)
+        valid_len = min(W - 1, context.pre_num_conv_tokens)
+        if valid_len > 0:
+            # heads[-valid_len:]: [valid_len, D] -> [D, valid_len]
+            initial_state[0, :, -valid_len:] = heads[-valid_len:].T
         return initial_state
 
     @staticmethod
@@ -105,17 +165,24 @@ class CausalConv1dFunctionCP(torch.autograd.Function):
             # of initial_state; gradients for the remaining (zero-padded) positions
             # must not flow back, otherwise they leak into unrelated sequences.
             valid_len = min(W - 1, pre_num_conv_tokens)
-            d_initial_state = torch.zeros(W-1, D, device=dx.device, dtype=dx.dtype)
+            d_initial_state = torch.zeros(W - 1, D, device=dx.device, dtype=dx.dtype)
             if valid_len > 0:
                 d_initial_state[-valid_len:] = dh0[0, :, -valid_len:].T
         else:
             # dh0 is None only when this is the first rank (no initial_state needed)
             assert is_first_rank, "dh0 should not be None when is_first_rank=False"
-            d_initial_state = torch.zeros(W-1, D, device=dx.device, dtype=dx.dtype)
-        # Sync communication: send d_initial_state to previous rank, receive from next rank
-        recv_d_init = conv_cp_send_recv_bwd(d_initial_state, group)  # [W-1, D]
-        # Add to current rank's last W-1 tokens (these tokens are used as initial_state by next rank)
-        dx[0, -(W-1):, :].add_(recv_d_init)
+            d_initial_state = torch.zeros(W - 1, D, device=dx.device, dtype=dx.dtype)
+        if dx.shape[1] < W - 1:
+            gathered_gradients, _ = all_gather_into_tensor(d_initial_state, group=group)
+            CausalConv1dFunctionCP._accumulate_multi_rank_halo_gradients(
+                dx,
+                gathered_gradients,
+                rank=dist.get_rank(group),
+            )
+        else:
+            # Add the next rank's initial-state gradient to the local tail.
+            recv_d_init = conv_cp_send_recv_bwd(d_initial_state, group)
+            dx[0, -(W - 1) :, :].add_(recv_d_init)
 
     @staticmethod
     def forward(
