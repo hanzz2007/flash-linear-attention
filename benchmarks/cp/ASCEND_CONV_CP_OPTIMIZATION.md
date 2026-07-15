@@ -113,3 +113,65 @@ Communication-only measurements include one forward and one backward halo exchan
 The initial CP8 P2P communication run had an outlier and 37.5% CV. Per the frozen timing protocol, exactly one 50-sample confirmation was run; it measured p20/p50/p80 `0.644/0.661/0.675 ms` with 4.05% CV. P2P therefore does not meet the promotion rule of at least 5% CP8 end-to-end improvement with no greater than 2% CP2/4 regression. All-gather remains the default, while P2P is retained behind the explicit switch for reproducible A/B testing. No communication-overlap candidate was merged because the synchronous P2P primitive did not first establish a benefit.
 
 Stage 4 commit: `1c0d674a`.
+
+## Stage 5 — precision gate, fixed schedule, and final matrix
+
+`FLA_ASCEND_CONV_PRECISION=high|a800` is now validated by the Ascend backend. `high` remains the default. The selector maintains an explicit promotion bucket list, but that list is intentionally empty after both reduced-precision candidates failed at least one immutable gate. An `a800` request therefore reports requested `a800`, effective `high`, and safely executes the general FP32-`dpre` path. Unsupported or unpromoted shapes never enter dead-reckoned low precision.
+
+The target `Tlocal=2048,D=3072,W=4,BF16` numerical study used the same independent FP32 reference and inputs on both platforms:
+
+| Path | output | dx | dw | db | dh0 |
+| ---- | -----: | -: | -: | -: | --: |
+| A800 production | 7.84e-6 | 7.64e-4 | 7.81e-4 | 6.07e-4 | 2.77e-3 |
+| 910B BF16 `dpre` | 1.25e-5 | 2.69e-3 | 3.62e-3 | 2.56e-3 | 3.49e-3 |
+| 910B FP16 `dpre` | 1.25e-5 | 9.31e-4 | 8.31e-4 | 1.62e-3 | 2.85e-3 |
+
+BF16 `dpre` reduced the single-rank peak from 105.1 MiB to 90.1 MiB, but regressed p50 from 6.238 ms to 6.351 ms and exceeded the A800-relative error envelope. FP16 `dpre` measured 6.412 ms, retained a 105.1 MiB measured peak because mixed BF16/FP16 reductions created promoted temporaries, and failed the `db` gate. Neither candidate met the planned 30% memory reduction, correctness, or speed requirements, so neither is reachable from the public selector.
+
+Backward scheduling was tuned independently from the frozen forward tile. Candidate results use three warmups and ten samples at D3072:
+
+| Backward tile/schedule | fwd+bwd p50 | Decision |
+| ---------------------- | -----------: | -------- |
+| `64x128`, 2 warps | 6.238 ms | baseline |
+| `32x256`, 2 warps | 7.304 ms | reject, 17.1% slower |
+| `128x64`, 2 warps | 6.211 ms | reject, within noise |
+| `64x128`, 4 warps | 6.027 ms | retain for target buckets |
+| `128x64`, 4 warps | 6.201 ms | reject |
+
+The retained four-warp schedule is restricted to contiguous BF16 `W=4,D=1024/3072,T>=64`; all other dense cases keep two warps. At D1024 its candidate p50 changed from 3.474 ms to 3.349 ms. The final five-warmup/30-sample run is reported below rather than substituting the shorter candidate timing.
+
+### Final single-rank kernel-only results
+
+All times are synchronized wall-clock. Backward is derived as `fwd+bwd - fwd` from separately synchronized medians.
+
+| D | Platform | Forward p20/p50/p80 | Fwd+bwd p20/p50/p80 | CV fwd/total | Derived bwd | Peak total | 910B/A800 fwd/total/bwd |
+| --: | -------- | --------------------: | ------------------------: | -----------: | ----------: | ---------: | ----------------------: |
+| 1024 | A800 | 0.202/0.208/0.215 ms | 0.933/0.947/0.963 ms | 7.42%/11.24% | 0.739 ms | 28.7 MiB | 1.00x/1.00x/1.00x |
+| 1024 | 910B | 1.430/1.445/1.465 ms | 3.435/3.463/3.490 ms | 1.27%/0.81% | 2.019 ms | 36.1 MiB | 6.96x/3.66x/2.73x |
+| 3072 | A800 | 0.202/0.205/0.219 ms | 0.933/0.948/0.959 ms | 7.15%/12.18% | 0.743 ms | 86.0 MiB | 1.00x/1.00x/1.00x |
+| 3072 | 910B | 2.590/2.601/2.615 ms | 5.987/6.001/6.023 ms | 0.54%/0.38% | 3.399 ms | 105.1 MiB | 12.71x/6.33x/4.57x |
+
+Every A800 kernel-only 30-sample run exceeded the 5% CV trigger, so exactly one 50-sample confirmation is shown. Its remaining long tails are retained in the CV instead of being filtered. The current A800 D3072 forward is 1.1% faster than the frozen Stage 2 value and fwd+bwd is 18.6% faster than the Stage 1 value, so the unchanged CUDA kernel has no measured regression greater than 2%.
+
+The required kernel-only `910B/A800 <=2x` target is not met. Compared with the original exploratory 910B component baselines, D3072 forward improves from 20.028 ms to 2.601 ms (`7.70x`) and derived backward from 90.653 ms to 3.399 ms (`26.67x`), but the final gaps remain dominated by the four-tap vector forward and FP32 activation/reduction work.
+
+### Final CP2/4/8 end-to-end results
+
+All results use all-gather, five warmups, and 30 samples. A point whose CV exceeded 5% was replaced by exactly one 50-sample confirmation. The p50 comparison is:
+
+| D | CP | 910B p50 | A800 p50 | 910B/A800 | 910B global tokens/s |
+| --: | --: | --------: | --------: | ---------: | -------------------: |
+| 1024 | 2 | 12.551 ms | 1.912 ms | 6.56x | 1.31M |
+| 1024 | 4 | 7.160 ms | 2.035 ms | 3.52x | 2.29M |
+| 1024 | 8 | 4.510 ms | 2.055 ms | 2.19x | 3.63M |
+| 3072 | 2 | 23.315 ms | 1.987 ms | 11.73x | 0.70M |
+| 3072 | 4 | 12.377 ms | 2.088 ms | 5.93x | 1.32M |
+| 3072 | 8 | 6.700 ms | 2.225 ms | 3.01x | 2.45M |
+
+The 910B CP2-to-CP4, CP4-to-CP8, and overall CP2-to-CP8 strong-scaling efficiencies are respectively `87.6%/79.4%/69.6%` for D1024 and `94.2%/92.4%/87.0%` for D3072. Thus D3072 passes the 80% scaling target while D1024 does not. CP8 D1024 passes the end-to-end `<=2.5x` A800 gap target; D3072 remains at `3.01x` and does not pass. A800 itself has only about 22%-23% CP2-to-CP8 efficiency at this fixed global length because its sub-millisecond local kernel is dominated by fixed launch/collective synchronization overhead; this is why the absolute CP8 gap contracts even though 910B does not reach the kernel-only target.
+
+CP8 correctness passes on both HCCL/910B and NCCL/A800 for D1024 and D3072. The A800 CP8 BF16 `dw` RMS baseline is `4.335e-3` and 910B is `4.342e-3`; the CP8 parameter-gradient gate is therefore frozen at their A800 `1.10x` envelope (`4.8e-3`). CP2 keeps its `3.3e-3` gate. Output and `dx` remain below `1e-3` for every world size.
+
+The first cold distributed specializations took about 14 s on the 910B stack and 38 s on the A800 stack. Compilation is reported independently and excluded from every warm latency sample.
+
+Stage 5 commit: pending.

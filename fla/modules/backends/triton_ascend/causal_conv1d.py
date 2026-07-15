@@ -7,6 +7,8 @@
 
 """Causal 1D convolution kernels adapted for triton-ascend on Huawei NPU."""
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -22,7 +24,53 @@ _ELEM_BLOCK = 2048
 _FWD_DENSE_BT = 64
 _FWD_DENSE_BD = 128
 _FWD_DENSE_WARPS = 2
+_BWD_DENSE_BT = 64
+_BWD_DENSE_BD = 128
+_BWD_DENSE_WARPS = 2
 _BWD_REDUCE_T = 512
+_CONV_PRECISION_ENV = "FLA_ASCEND_CONV_PRECISION"
+_CONV_PRECISION_MODES = ("high", "a800")
+_TARGET_BF16_DIMS = (1024, 3072)
+# Low-precision candidates are promoted here only after passing both the
+# A800-relative numerical gate and the performance gate.
+_A800_PRECISION_DIMS: tuple[int, ...] = ()
+
+
+def _ascend_conv_precision_mode() -> str:
+    mode = os.environ.get(_CONV_PRECISION_ENV, "high").lower()
+    if mode not in _CONV_PRECISION_MODES:
+        choices = ", ".join(_CONV_PRECISION_MODES)
+        raise ValueError(f"{_CONV_PRECISION_ENV} must be one of {choices}, but got {mode!r}")
+    return mode
+
+
+def _dense_backward_precision_mode(x: torch.Tensor, weight: torch.Tensor) -> str:
+    """Select the validated low-precision bucket or the general high path."""
+    requested = _ascend_conv_precision_mode()
+    if (
+        requested == "a800"
+        and x.dim() == 3
+        and x.shape[0] == 1
+        and x.shape[1] >= 64
+        and x.shape[2] in _A800_PRECISION_DIMS
+        and x.dtype == torch.bfloat16
+        and weight.shape == (x.shape[2], 4)
+    ):
+        return "a800"
+    return "high"
+
+
+def _dense_backward_num_warps(x: torch.Tensor, weight: torch.Tensor) -> int:
+    """Use the measured four-warp schedule only for production BF16 buckets."""
+    if (
+        x.shape[0] == 1
+        and x.shape[1] >= 64
+        and x.shape[2] in _TARGET_BF16_DIMS
+        and x.dtype == torch.bfloat16
+        and weight.shape == (x.shape[2], 4)
+    ):
+        return 4
+    return _BWD_DENSE_WARPS
 
 
 def _elementwise_launch_iters(numel: int):
@@ -450,18 +498,25 @@ def _launch_bwd_dense(
     initial_state: torch.Tensor | None,
     activation: str | None,
     poison: bool = False,
+    precision_mode: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
-    """Launch the dense high-precision backward pipeline without partial workspaces."""
+    """Launch the dense backward pipeline without partial workspaces."""
     _, T, D = x.shape
     W = weight.shape[1]
-    NT = triton.cdiv(T, _FWD_DENSE_BT)
-    DB = triton.cdiv(D, _FWD_DENSE_BD)
+    if precision_mode is None:
+        precision_mode = _dense_backward_precision_mode(x, weight)
+    if precision_mode not in _CONV_PRECISION_MODES:
+        raise ValueError(f"unexpected dense backward precision mode {precision_mode!r}")
+    NT = triton.cdiv(T, _BWD_DENSE_BT)
+    DB = triton.cdiv(D, _BWD_DENSE_BD)
+    num_warps = _dense_backward_num_warps(x, weight)
     n_tasks = NT * DB
     fill = float("nan") if poison else None
+    dpre_dtype = x.dtype if precision_mode == "a800" else torch.float32
     dpre = (
-        torch.full_like(x, fill, dtype=torch.float32, memory_format=torch.contiguous_format)
+        torch.full_like(x, fill, dtype=dpre_dtype, memory_format=torch.contiguous_format)
         if poison
-        else torch.empty_like(x, dtype=torch.float32, memory_format=torch.contiguous_format)
+        else torch.empty_like(x, dtype=dpre_dtype, memory_format=torch.contiguous_format)
     )
 
     common = dict(
@@ -470,9 +525,9 @@ def _launch_bwd_dense(
         W=W,
         NT=NT,
         DB=DB,
-        BT=_FWD_DENSE_BT,
-        BD=_FWD_DENSE_BD,
-        num_warps=_FWD_DENSE_WARPS,
+        BT=_BWD_DENSE_BT,
+        BD=_BWD_DENSE_BD,
+        num_warps=num_warps,
         multibuffer=False,
     )
     for task_off in range(0, n_tasks, _NPU_MAX_TRITON_GRID):
@@ -520,8 +575,8 @@ def _launch_bwd_dense(
             T=T,
             D=D,
             W=W,
-            BD=_FWD_DENSE_BD,
-            num_warps=_FWD_DENSE_WARPS,
+            BD=_BWD_DENSE_BD,
+            num_warps=num_warps,
             multibuffer=False,
         )
     return dx, dw, db, dh0, dpre
@@ -1278,6 +1333,7 @@ def causal_conv1d_fwd_npu(
     layout_fallback: bool = False,
 ):
     del layout_fallback
+    _ascend_conv_precision_mode()
     shape = x.shape
     if x.shape[-1] != weight.shape[0]:
         x = rearrange(x, "b t ... -> b t (...)")
@@ -1360,6 +1416,7 @@ def causal_conv1d_bwd_npu(
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
     ):
+        precision_mode = _dense_backward_precision_mode(x, weight)
         dx, dw, db, dh0, _ = _launch_bwd_dense(
             x=x,
             dy=dy,
@@ -1367,6 +1424,7 @@ def causal_conv1d_bwd_npu(
             bias=bias,
             initial_state=initial_state,
             activation=activation,
+            precision_mode=precision_mode,
         )
         dr = dy if residual is not None else None
         return dx.view(shape), dw, db, dr, dh0

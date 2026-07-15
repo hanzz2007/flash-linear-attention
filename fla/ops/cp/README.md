@@ -43,6 +43,8 @@ y_local, _ = causal_conv1d(
 > - `cp_context` is required; `cp_context.conv1d_kernel_size` and `cp_context.cu_seqlens` must be set.
 > - Do not pass `cu_seqlens` / `cu_seqlens_cpu` manually — they are taken from context.
 
+On Ascend, `FLA_ASCEND_CONV_PRECISION=high|a800` controls the internal Conv1d precision request. `high` is the default. The `a800` request automatically falls back to `high` unless a dtype/shape bucket has passed the frozen A800-relative correctness and performance gates; the current release promotes no reduced-precision bucket. `FLA_CP_CONV_COMM=all_gather|p2p` selects halo communication. All-gather is the default; P2P remains an opt-in benchmark route because it did not improve the measured CP8 target. See [the optimization record](../../../benchmarks/cp/ASCEND_CONV_CP_OPTIMIZATION.md) for the gates and CP2/4/8 evidence.
+
 ### KDA
 
 ```python

@@ -259,9 +259,12 @@ def run_cp_conv_test_worker(
                 assert_strict_close("Output", ref_out, y_cp_global)
                 assert_strict_close("dx", ref_dx, dx_cp_global)
                 # Each rank's parameter gradient is cast to the BF16 weight
-                # dtype before CP reduction. The frozen A800 target-shape RMS
-                # ratio is 2.978e-3, so retain its 1.10x numerical envelope.
-                parameter_ratio = 3.3e-3 if dtype == torch.bfloat16 else 1e-3
+                # dtype before CP reduction. The frozen A800 RMS ratios are
+                # 2.978e-3 at CP2 and 4.335e-3 at CP8, so retain their 1.10x
+                # world-size-specific numerical envelopes.
+                parameter_ratio = 1e-3
+                if dtype == torch.bfloat16:
+                    parameter_ratio = 4.8e-3 if world_size == 8 else 3.3e-3
                 assert_strict_close("dw", ref_dw, dw_cp, ratio=parameter_ratio)
                 assert_strict_close("db", ref_db, db_cp, ratio=parameter_ratio)
                 print(f"✅ [{test_name}] Test Passed!\n")
@@ -695,10 +698,9 @@ def test_cp_invalid_comm_method(monkeypatch):
         _resolve_conv_comm_method(None)
 
 
-@pytest.mark.skipif(not IS_NPU, reason="Ascend CP8 production-shape coverage")
 @pytest.mark.parametrize("D", [1024, 3072])
-def test_cp8_ascend_target(D):
-    """CP8 BF16 target with Tglobal=16384 and Tlocal=2048."""
+def test_cp8_target(D):
+    """CP8 BF16 production target with Tglobal=16384 and Tlocal=2048."""
     if device_torch_lib.device_count() < 8:
         pytest.skip("At least 8 accelerators required")
 

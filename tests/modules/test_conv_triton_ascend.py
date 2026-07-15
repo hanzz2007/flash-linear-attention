@@ -174,3 +174,24 @@ def test_dense_backward_nan_poisoning(W):
     outputs = _launch_bwd_dense(x, dy, weight, bias, initial_state, "silu", poison=True)
     for name, tensor in zip(("dx", "dw", "db", "dh0", "dpre"), outputs, strict=True):
         assert tensor is None or torch.isfinite(tensor).all().item(), f"{name} contains an unwritten or non-finite value"
+
+
+def test_dense_precision_selector(monkeypatch):
+    """The switch is validated and unpromoted shapes retain high precision."""
+    from fla.modules.backends.triton_ascend.causal_conv1d import (
+        _ascend_conv_precision_mode,
+        _dense_backward_num_warps,
+        _dense_backward_precision_mode,
+    )
+
+    x = torch.empty(1, 64, 1024, dtype=torch.bfloat16, device=device)
+    weight = torch.empty(1024, 4, dtype=torch.bfloat16, device=device)
+
+    monkeypatch.setenv("FLA_ASCEND_CONV_PRECISION", "a800")
+    assert _ascend_conv_precision_mode() == "a800"
+    assert _dense_backward_precision_mode(x, weight) == "high"
+    assert _dense_backward_num_warps(x, weight) == 4
+
+    monkeypatch.setenv("FLA_ASCEND_CONV_PRECISION", "invalid")
+    with pytest.raises(ValueError, match="FLA_ASCEND_CONV_PRECISION"):
+        _ascend_conv_precision_mode()

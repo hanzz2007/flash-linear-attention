@@ -202,6 +202,14 @@ def main() -> None:
         inputs, do, cp_context = _make_inputs(args, local_rank, world_size, lengths)
     samples, peak_memory, compile_ms = _measure(args, inputs, do, cp_context, worker_device)
 
+    effective_precision = "cuda"
+    if IS_NPU:
+        effective_precision = "high"
+        if args.kind != "comm" and args.mode == "fwd_bwd":
+            from fla.modules.backends.triton_ascend.causal_conv1d import _dense_backward_precision_mode
+
+            effective_precision = _dense_backward_precision_mode(inputs[0], inputs[1])
+
     if rank == 0:
         mean_ms = statistics.fmean(samples)
         std_ms = statistics.pstdev(samples)
@@ -219,7 +227,8 @@ def main() -> None:
             "dim": args.dim,
             "width": args.width,
             "activation": args.activation,
-            "precision": args.precision,
+            "precision": effective_precision,
+            "precision_requested": args.precision,
             "comm": args.comm,
             "total_seq_len": args.total_seq_len,
             "local_seq_len": args.total_seq_len // world_size,
