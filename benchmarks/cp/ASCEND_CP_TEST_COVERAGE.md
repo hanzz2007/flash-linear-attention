@@ -22,8 +22,11 @@ Every numerical check also requires finite reference and actual tensors. Tests u
 | --- | --- | --- | --- | --- |
 | 1 | CP context validation, exact rank metadata, int32/int64 global inputs, copy semantics, coverage tags | 910B physical device 2; CP2 on devices 2–3; CANN 9.0.0, PyTorch 2.7.1, torch-npu 2.7.1.post6, Triton-Ascend 3.2.0 | 29 protocol tests and the existing CP2 Conv sequence-cut public test passed | `2f5d65c6` |
 | 2 | GDN primitive dimensions, GVA, non-power-of-two/tail tiles, K=1/193/256, precomputed gates, merge ordering, canaries, forced grid splitting | 910B physical device 2; same stack; isolated Triton caches | 8 PR primitives, 5 merge/grid cases, and 9 host gates passed. Cold-cache PR primitives took 295.53 s. | `41e3ae4e` |
+| 3 | Conv dense, packed varlen, FP32/layout fallback, structured impulses, final state, incremental cache, NaN poisoning, canaries, selector and pairwise coverage catalog | 910B physical device 2; same stack; isolated Triton caches | 32 PR gates passed. This includes `T=2048,D=3072,W=4` high forward/backward. The tests found and fixed repeated BF16 postprocessing casts, BF16 `dpre`, bias partial-workspace reduction, and a per-sequence reference-cast bug. | Recorded by phase 4 |
 
 The compatibility selector still accepts `FLA_ASCEND_CP_GDN_PRECISION=a800`, but A800-parity numerical and performance gates are excluded from the active test matrix. High precision is the only acceptance mode.
+
+For near-zero BF16 Conv parameter gradients, the single-device tests additionally freeze `max_abs <= 2.5e-4`; non-near-zero tensors must satisfy the RMS-ratio limit.
 
 ## Reproduction
 

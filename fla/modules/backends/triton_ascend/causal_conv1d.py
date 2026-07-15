@@ -599,6 +599,7 @@ def _launch_bwd_dense(
     {
         "HAS_WEIGHT": lambda args: args["weight"] is not None,
         "HAS_BIAS": lambda args: args["bias"] is not None,
+        "HAS_RESIDUAL": lambda args: args["residual"] is not None,
         "USE_INITIAL_STATE": lambda args: args["initial_state"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
@@ -609,6 +610,7 @@ def causal_conv1d_fwd_kernel(
     y,
     weight,
     bias,
+    residual,
     cu_seqlens,
     initial_state,
     chunk_indices,
@@ -623,6 +625,9 @@ def causal_conv1d_fwd_kernel(
     stride_y_n,
     stride_y_t,
     stride_y_d,
+    stride_residual_n,
+    stride_residual_t,
+    stride_residual_d,
     D: tl.constexpr,
     W: tl.constexpr,
     BT: tl.constexpr,
@@ -630,8 +635,10 @@ def causal_conv1d_fwd_kernel(
     BD: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    ACTIVATION: tl.constexpr,
 ):
     i_d = tl.program_id(0).to(tl.int64)
     i_t_local = tl.program_id(1).to(tl.int64)
@@ -645,12 +652,16 @@ def causal_conv1d_fwd_kernel(
         T = eos - bos
         p_x = x + bos * tl.cast(stride_x_t, tl.int64)
         p_y = y + bos * tl.cast(stride_y_t, tl.int64)
+        if HAS_RESIDUAL:
+            p_residual = residual + bos * tl.cast(stride_residual_t, tl.int64)
     else:
         i_n = tl.cast(B_OFFSET, tl.int64) + i_b_local
         i_t = chunk_id
         bos = i_n * tl.cast(T, tl.int64)
         p_x = x + i_n * tl.cast(stride_x_n, tl.int64)
         p_y = y + i_n * tl.cast(stride_y_n, tl.int64)
+        if HAS_RESIDUAL:
+            p_residual = residual + i_n * tl.cast(stride_residual_n, tl.int64)
 
     o_d = (tl.cast(D_BLOCK_OFFSET, tl.int64) + i_d) * BD + tl.arange(0, BD).to(tl.int64)
     o_w = tl.arange(0, BW) + W - BW
@@ -689,6 +700,16 @@ def causal_conv1d_fwd_kernel(
 
     if HAS_BIAS:
         b_y += tl.load(bias + o_d, mask=m_d).to(tl.float32)[None, :]
+    if ACTIVATION:
+        b_y *= tl.sigmoid(b_y)
+    if HAS_RESIDUAL:
+        b_y += tl.load(
+            p_residual
+            + o_t[:, None] * tl.cast(stride_residual_t, tl.int64)
+            + o_d[None, :] * tl.cast(stride_residual_d, tl.int64),
+            mask=m_t[:, None] & m_d[None, :],
+            other=0,
+        ).to(tl.float32)
 
     tl.store(
         p_y
@@ -817,8 +838,9 @@ def _silu_bwd_kernel(
     tl.store(out_ptr + out_off, out.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-def _launch_silu_bwd(y_pre: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
-    out = torch.zeros_like(dy, memory_format=torch.contiguous_format)
+def _launch_silu_bwd(y_pre: torch.Tensor, dy: torch.Tensor, *, poison: bool = False) -> torch.Tensor:
+    fill = float("nan") if poison else 0.0
+    out = torch.full_like(dy, fill, dtype=torch.float32, memory_format=torch.contiguous_format)
     B, T, D = dy.shape
     n = B * T * D
     sy_n, sy_t, sy_d = y_pre.stride()
@@ -1368,6 +1390,10 @@ def _launch_fwd_core(
     BT: int,
     BD: int | None = None,
     num_warps: int | None = None,
+    residual: torch.Tensor | None = None,
+    activation: str | None = None,
+    output_dtype: torch.dtype | None = None,
+    poison: bool = False,
 ) -> torch.Tensor:
     if BD is None or num_warps is None:
         BD, BT, num_warps = _npu_tile_config(T, BT, D, x.dtype, initial_state)
@@ -1375,14 +1401,21 @@ def _launch_fwd_core(
     BW = triton.next_power_of_2(W)
 
     stride_x_n, stride_x_t, stride_x_d = x.stride()
-    y = torch.zeros_like(x, memory_format=torch.contiguous_format)
+    fill = float("nan") if poison else 0.0
+    y = torch.full_like(x, fill, dtype=output_dtype, memory_format=torch.contiguous_format)
     stride_y_n, stride_y_t, stride_y_d = y.stride()
+    if residual is not None and residual.stride() != y.stride():
+        residual = residual.contiguous()
+    stride_residual_n = stride_residual_t = stride_residual_d = 0
+    if residual is not None:
+        stride_residual_n, stride_residual_t, stride_residual_d = residual.stride()
 
     kernel_kwargs = dict(
         x=x,
         y=y,
         weight=weight,
         bias=bias,
+        residual=residual,
         cu_seqlens=cu_seqlens,
         initial_state=initial_state,
         B=B,
@@ -1398,6 +1431,10 @@ def _launch_fwd_core(
         stride_y_n=stride_y_n,
         stride_y_t=stride_y_t,
         stride_y_d=stride_y_d,
+        stride_residual_n=stride_residual_n,
+        stride_residual_t=stride_residual_t,
+        stride_residual_d=stride_residual_d,
+        ACTIVATION=activation in ("swish", "silu"),
         num_warps=num_warps,
     )
     for b_off, b_len, nt_off, nt_len, d_off, d_len in _iter_3d_grid_splits(B, NT, D, BD):
@@ -1462,8 +1499,9 @@ def causal_conv1d_fwd_npu(
             BT,
             BD,
             num_warps,
+            residual,
+            activation,
         )
-        y = _postprocess_fwd(y, residual, activation)
 
     final_state = None
     if output_final_state:
@@ -1551,6 +1589,7 @@ def causal_conv1d_bwd_npu(
             BT_f,
             BD_f,
             nw_f,
+            output_dtype=torch.float32,
         )
         dy_conv = _launch_silu_bwd(y_pre, dy)
 
@@ -1564,7 +1603,7 @@ def causal_conv1d_bwd_npu(
     if use_seq:
         block = 1024
         dw = weight.new_empty(B * T, *weight.shape, dtype=torch.float) if weight is not None else None
-        db = bias.new_empty(B * T, *bias.shape, dtype=torch.float) if bias is not None else None
+        db = None
         grid = (triton.cdiv(B * T * D, block),)
         causal_conv1d_bwd_seq_kernel[grid](
             x=x,
@@ -1594,7 +1633,7 @@ def causal_conv1d_bwd_npu(
             dy_conv = dy_conv.contiguous()
         stride_dy_n, stride_dy_t, stride_dy_d = dy_conv.stride()
         dw = weight.new_empty(B * NT, *weight.shape, dtype=torch.float) if weight is not None else None
-        db = bias.new_empty(B * NT, *bias.shape, dtype=torch.float) if bias is not None else None
+        db = None
         kernel_kwargs = dict(
             x=x,
             weight=weight,
@@ -1634,7 +1673,7 @@ def causal_conv1d_bwd_npu(
     if weight is not None:
         dw = dw.sum(0).to(weight)
     if bias is not None:
-        db = db.sum(0).to(bias)
+        db = dy_conv.float().sum(dim=(0, 1)).to(bias)
 
     dh0 = None
     if initial_state is not None:
@@ -1706,6 +1745,7 @@ def causal_conv1d_update_states_npu(
     initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
     layout_fallback: bool = False,
+    poison: bool = False,
 ) -> torch.Tensor:
     del layout_fallback
     if cu_seqlens is not None:
@@ -1725,7 +1765,8 @@ def causal_conv1d_update_states_npu(
         stride_x_n, stride_x_t, stride_x_d = x.stride()
 
     W = state_len
-    final_state = torch.empty(N, D, W, dtype=x.dtype, device=x.device)
+    fill = float("nan") if poison else 0.0
+    final_state = torch.full((N, D, W), fill, dtype=x.dtype, device=x.device)
     BD = min(triton.next_power_of_2(D), 16)
     BW = triton.next_power_of_2(W)
     kernel_kwargs = dict(
