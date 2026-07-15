@@ -206,7 +206,9 @@ def test_build_cp_context_uses_process_group_rank(monkeypatch: pytest.MonkeyPatc
         (torch.tensor([0, 4]), {"world_size": 2, "rank": 2}, ValueError, "rank must be in"),
         (torch.tensor([0, 4]), {"world_size": 2}, ValueError, "rank is required"),
         (torch.tensor([0, 4]), {}, ValueError, "group is required"),
-        (torch.tensor([0, 4]), {"world_size": 1, "rank": 0, "conv1d_kernel_size": 0}, ValueError, "positive integer"),
+        (torch.tensor([0, 4]), {"world_size": 1, "rank": 0, "conv1d_kernel_size": 0}, ValueError, "one of"),
+        (torch.tensor([0, 4]), {"world_size": 1, "rank": 0, "conv1d_kernel_size": 1}, ValueError, "one of"),
+        (torch.tensor([0, 4]), {"world_size": 1, "rank": 0, "conv1d_kernel_size": 5}, ValueError, "one of"),
     ],
     ids=[
         "wrong-dtype",
@@ -223,6 +225,8 @@ def test_build_cp_context_uses_process_group_rank(monkeypatch: pytest.MonkeyPatc
         "missing-rank",
         "missing-group",
         "invalid-conv-width",
+        "conv-width-one",
+        "conv-width-five",
     ],
 )
 def test_cp_context_rejects_invalid_inputs(cu_seqlens, kwargs, error, match) -> None:

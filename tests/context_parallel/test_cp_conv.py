@@ -257,11 +257,14 @@ def run_cp_conv_test_worker(
             print(f"\n[{test_name}] Verification Results:")
             try:
                 assert_strict_close("Output", ref_out, y_cp_global)
-                assert_strict_close("dx", ref_dx, dx_cp_global)
+                # In the multi-hop BF16 case, dx includes communicated dh0
+                # values. Those values follow the public BF16 dh0 contract, so
+                # apply its frozen 3.1e-3 envelope after FP32 rank accumulation.
+                dx_ratio = 3.1e-3 if dtype == torch.bfloat16 and chunk_size < W - 1 else 1e-3
+                assert_strict_close("dx", ref_dx, dx_cp_global, ratio=dx_ratio)
                 # Each rank's parameter gradient is cast to the BF16 weight
-                # dtype before CP reduction. The frozen A800 RMS ratios are
-                # 2.978e-3 at CP2 and 4.335e-3 at CP8, so retain their 1.10x
-                # world-size-specific numerical envelopes.
+                # dtype before CP reduction, so use the frozen world-size
+                # envelopes for distributed BF16 reduction.
                 parameter_ratio = 1e-3
                 if dtype == torch.bfloat16:
                     parameter_ratio = 4.8e-3 if world_size == 8 else 3.3e-3
@@ -687,6 +690,69 @@ def test_cp_halo_left_padding():
     halo = CausalConv1dFunctionCP._right_aligned_halo(x, 3)
     expected = torch.cat((torch.zeros(2, 8, device=x.device), x), dim=0)
     torch.testing.assert_close(halo, expected, rtol=0, atol=0)
+
+
+def test_cp_multi_rank_halo_assembly_order():
+    """A W=4 halo can span three earlier ranks when each rank owns one token."""
+    from fla.modules.conv.cp.ops import CausalConv1dFunctionCP
+
+    gathered = torch.tensor(
+        [
+            [[0.0], [0.0], [10.0]],
+            [[0.0], [0.0], [20.0]],
+            [[0.0], [0.0], [30.0]],
+            [[0.0], [0.0], [40.0]],
+        ]
+    )
+    actual = CausalConv1dFunctionCP._assemble_previous_halo(gathered, rank=3, local_t=1, needed=3)
+    torch.testing.assert_close(actual, torch.tensor([[10.0], [20.0], [30.0]]), rtol=0, atol=0)
+
+    right_aligned = CausalConv1dFunctionCP._assemble_previous_halo(gathered, rank=3, local_t=1, needed=2)
+    torch.testing.assert_close(right_aligned, torch.tensor([[0.0], [20.0], [30.0]]), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("rank", "expected"),
+    [
+        (0, 6.0),
+        (1, 50.0),
+        (2, 300.0),
+        (3, 0.0),
+    ],
+)
+def test_cp_multi_rank_halo_gradient_mapping(rank, expected):
+    """Every right-aligned source position maps to its owning global token."""
+    from fla.modules.conv.cp.ops import CausalConv1dFunctionCP
+
+    gathered = torch.tensor(
+        [
+            [[0.0], [0.0], [0.0]],
+            [[0.0], [0.0], [1.0]],
+            [[0.0], [2.0], [20.0]],
+            [[3.0], [30.0], [300.0]],
+        ]
+    )
+    dx = torch.zeros(1, 1, 1)
+    CausalConv1dFunctionCP._accumulate_multi_rank_halo_gradients(dx, gathered, rank=rank)
+    assert dx.item() == expected
+
+
+@pytest.mark.cp_distributed
+@pytest.mark.parametrize("comm", ["all_gather", "p2p"])
+def test_cp4_multi_hop_short_local_chunk(comm, monkeypatch):
+    """Tlocal=1 and W=4 requires three-hop forward and backward halo propagation."""
+    if device_torch_lib.device_count() < 4:
+        pytest.skip("At least 4 accelerators required")
+    monkeypatch.setenv("FLA_CP_CONV_COMM", comm)
+    run_cp_test_with_spawn(
+        world_size=4,
+        test_name=f"CP4_MultiHopShortHalo_{comm}",
+        T=4,
+        D=17,
+        W=4,
+        lengths=[4],
+        dtype=torch.bfloat16,
+    )
 
 
 def test_cp_invalid_comm_method(monkeypatch):

@@ -80,9 +80,9 @@ def get_cp_cu_seqlens(
     if isinstance(rank, bool) or not isinstance(rank, int) or not 0 <= rank < world_size:
         raise ValueError(f"rank must be in [0, {world_size}), got {rank!r}")
     if conv1d_kernel_size is not None and (
-        isinstance(conv1d_kernel_size, bool) or not isinstance(conv1d_kernel_size, int) or conv1d_kernel_size <= 0
+        isinstance(conv1d_kernel_size, bool) or not isinstance(conv1d_kernel_size, int) or conv1d_kernel_size not in (2, 3, 4)
     ):
-        raise ValueError(f"conv1d_kernel_size must be a positive integer, got {conv1d_kernel_size!r}")
+        raise ValueError(f"conv1d_kernel_size must be one of (2, 3, 4), got {conv1d_kernel_size!r}")
 
     if not isinstance(cu_seqlens, torch.Tensor):
         raise TypeError(f"cu_seqlens must be a tensor, got {type(cu_seqlens).__name__}")
