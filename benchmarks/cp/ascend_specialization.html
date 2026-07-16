@@ -105,7 +105,7 @@
         <span class="pill ok">CP2 / CP4 / CP8 通过</span>
         <span class="pill ok">High 精度</span>
         <span class="pill">无上游 PR</span>
-        <span class="pill">性能数据未采信</span>
+        <span class="pill ok">8 卡成对性能已复测</span>
       </div>
     </section>
     <aside class="panel hero-metric">
@@ -117,9 +117,39 @@
 
   <section class="cards">
     <div class="panel metric"><b>55</b><small>机器检查的 kernel specialization contracts</small></div>
-    <div class="panel metric"><b>65</b><small>最终 manifest / coverage / halo 测试通过</small></div>
-    <div class="panel metric"><b>30</b><small>Conv 单 NPU 非 nightly 矩阵通过</small></div>
-    <div class="panel metric"><b>6</b><small>CP2/4/8 分布式代表用例通过</small></div>
+    <div class="panel metric"><b>-4.5%</b><small>GDN CP8 冷启动时间</small></div>
+    <div class="panel metric"><b>+0.2%</b><small>GDN CP8 稳态配对均值变化</small></div>
+    <div class="panel metric"><b>19.8×</b><small>GDN 910B / A800 production-stack 差距</small></div>
+  </section>
+
+  <section class="grid-2" style="margin-top:20px">
+    <article class="panel">
+      <h2>910B baseline ↔ candidate 配对</h2>
+      <table>
+        <thead><tr><th>CP8 packed BF16 fwd+bwd</th><th>Baseline</th><th>Candidate</th><th>结果</th></tr></thead>
+        <tbody>
+          <tr><td>GDN 稳态中位数</td><td>86.214 / 86.507 ms</td><td>86.456 / 86.635 ms</td><td class="ok-text">均值 +0.2%</td></tr>
+          <tr><td>GDN 冷启动</td><td>194.20 s</td><td>185.39 s</td><td class="ok-text">-4.5%</td></tr>
+          <tr><td>Conv 稳态中位数</td><td>40.316 / 41.288 ms</td><td>40.533 / 40.041 ms</td><td class="ok-text">均值 -1.3%</td></tr>
+          <tr><td>Conv 冷启动</td><td>54.57 s</td><td>55.02 s</td><td>+0.8%</td></tr>
+        </tbody>
+      </table>
+      <p class="muted">独立目录与 Triton cache；顺序为 baseline→candidate、candidate→baseline；每轮 3 warmup + 10 samples。</p>
+    </article>
+
+    <article class="panel">
+      <h2>隔离磁盘缓存</h2>
+      <table>
+        <thead><tr><th>目标 shape</th><th>Baseline</th><th>Candidate</th><th>变化</th></tr></thead>
+        <tbody>
+          <tr><td>GDN 文件数</td><td>1,394</td><td>1,314</td><td class="ok-text">-5.7%</td></tr>
+          <tr><td>GDN 总字节</td><td>3.760 GB</td><td>3.758 GB</td><td>-0.05%</td></tr>
+          <tr><td>Conv 文件数</td><td>275</td><td>278</td><td>+1.1%</td></tr>
+          <tr><td>Conv 总字节</td><td>3.658 GB</td><td>3.659 GB</td><td>+0.04%</td></tr>
+        </tbody>
+      </table>
+      <p class="note">单一 shape 不会展示全部动态 shape 收益；aggregate bytes 又被共享编译器大文件主导。跨 1/D/N/i32/i64 的单 cache-entry 测试才是去特化的直接证据。</p>
+    </article>
   </section>
 
   <section class="grid-2">
@@ -199,13 +229,19 @@
   <section class="grid-2" style="margin-top:20px">
     <article class="panel">
       <h2>效率与 A800 差距</h2>
+      <table>
+        <thead><tr><th>Candidate CP8</th><th>910B</th><th>A800</th><th>差距</th></tr></thead>
+        <tbody>
+          <tr><td>GDN packed</td><td>86.545 ms</td><td>4.382 ms</td><td><strong>19.8×</strong></td></tr>
+          <tr><td>Conv D=1024 packed</td><td>40.287 ms</td><td>2.149 ms</td><td><strong>约 18.8×</strong></td></tr>
+        </tbody>
+      </table>
       <ul>
-        <li>已实测：4 种动态整数类别只产生 1 个内存 cache entry，首编译后磁盘产物数不再增长。</li>
-        <li>预期收益集中在冷启动、动态 shape 切换和 cache 占用；稳态算术与通信量不变。</li>
-        <li>CUDA/A800 文件未修改，本阶段未重新测量 A800 回退或 910B/A800 比率。</li>
-        <li>此前非可信性能数据已排除，不用作效果证明。</li>
+        <li>GDN A800 CV 6.7%–9.2%，19.8× 可作为 production-stack 端到端差距。</li>
+        <li>Conv A800 CV 8.0%–13.5%，合理范围为 17.6×–20.1×，不宣称亚百分比精度。</li>
+        <li>A800 两轮 baseline/candidate 差异方向反转，CUDA 路径无确认性回退。</li>
       </ul>
-      <p class="note">精确效率差距需用两个独立 worktree、隔离 Triton cache、相同栈元数据和 baseline↔candidate 交替顺序重新采集。</p>
+      <p class="note">这不是纯硬件峰值比：两端 PyTorch、Triton、collective backend 和 kernel 实现均不同。约 20× 的主要执行差距需要后续 profiler 与算法/调度优化，不能由编译去特化解决。</p>
     </article>
 
     <article class="panel">
@@ -214,7 +250,8 @@
       <div class="commit"><span class="n">2</span><code>f3ae596e</code><span>GDN CP/shared 去特化</span></div>
       <div class="commit"><span class="n">3</span><code>3ef2354c</code><span>Packed-varlen Conv 去特化</span></div>
       <div class="commit"><span class="n">4</span><code>1aa26729</code><span>Dense Conv 3D grid</span></div>
-      <div class="commit"><span class="n">5</span><code>delivery</code><span>最终报告（SHA 见交付摘要）</span></div>
+      <div class="commit"><span class="n">5</span><code>7b1b5d18</code><span>初版最终报告</span></div>
+      <div class="commit"><span class="n">6</span><code>delivery</code><span>独占 8 卡配对证据（SHA 见交付摘要）</span></div>
     </article>
   </section>
 
